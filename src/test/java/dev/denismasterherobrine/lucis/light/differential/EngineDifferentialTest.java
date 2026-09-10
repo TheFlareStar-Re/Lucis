@@ -76,6 +76,42 @@ class EngineDifferentialTest {
         scenario.runToggleScenario("seed=0x7A11");
     }
 
+    @Test
+    void fullyOpenWorldMatchesReference() {
+        Scenario scenario = new Scenario(0xF11);
+        scenario.fillUniform(AIR);
+        scenario.assertInitialMatchesReference("fully-open");
+        List<int[]> edits = new ArrayList<>();
+        edits.add(scenario.editPlace(WIDTH / 2, HEIGHT / 2, WIDTH / 2, STONE));
+        edits.add(scenario.editPlace(WIDTH / 2 + 2, HEIGHT / 2, WIDTH / 2, GLOWSTONE));
+        scenario.applyBatchAndCompare(edits, "fully-open place");
+    }
+
+    @Test
+    void mixedOpenAndRoofedColumnsMatchReference() {
+        Scenario scenario = new Scenario(0xF12);
+        scenario.fillUniform(AIR);
+        scenario.assertInitialMatchesReference("half-roof initial");
+        int roofY = HEIGHT / 2;
+        List<int[]> roof = new ArrayList<>();
+        for (int z = 0; z < WIDTH / 2; z++) {
+            for (int x = 0; x < WIDTH; x++) {
+                roof.add(scenario.editPlace(x, roofY, z, STONE));
+            }
+        }
+        scenario.applyBatchAndCompare(roof, "half-roof placed");
+        List<int[]> holes = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            int x = scenario.random.nextInt(WIDTH);
+            int z = scenario.random.nextInt(WIDTH / 2);
+            holes.add(scenario.editPlace(x, roofY, z, AIR));
+        }
+        scenario.applyBatchAndCompare(holes, "half-roof holes");
+        scenario.applyBatchAndCompare(roof.stream()
+                .map(edit -> scenario.editPlace(edit[0], edit[1], edit[2], AIR))
+                .toList(), "half-roof removed");
+    }
+
     private static final class Scenario {
         private final RegionLightData data;
         private final ReferenceLightEngine reference;
@@ -123,6 +159,23 @@ class EngineDifferentialTest {
                     }
                 }
             }
+        }
+
+        private void fillUniform(Material material) {
+            for (int y = 0; y < HEIGHT; y++) {
+                for (int z = 0; z < WIDTH; z++) {
+                    for (int x = 0; x < WIDTH; x++) {
+                        setMaterial(x, y, z, material);
+                    }
+                }
+            }
+        }
+
+        private void applyBatchAndCompare(List<int[]> edits, String stage) {
+            batchCounter++;
+            applyBatch(edits);
+            reference.recompute();
+            compare(stage + "#" + batchCounter);
         }
 
         private void assertInitialMatchesReference(String stage) {

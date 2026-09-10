@@ -41,11 +41,36 @@ public final class LucisSkyLightEngine {
         }
 
         Arrays.fill(data.skyLight, (byte) 0);
+        int openColumnsFast = 0;
         for (int z = 0; z < depth; z++) {
             int columnZBase = z * width;
             for (int x = 0; x < width; x++) {
                 int columnBase = columnZBase + x;
                 int y = height - 1;
+                
+                // Fast path: detect fully-open columns (all transparent from top to bottom)
+                boolean fullyOpen = true;
+                for (int scanY = height - 1; scanY >= 0; scanY--) {
+                    if ((data.opacity[columnBase + scanY * area] & 0xF) != 0) {
+                        fullyOpen = false;
+                        break;
+                    }
+                }
+                
+                if (fullyOpen) {
+                    // Bulk-fill entire column with MAX_LIGHT using Arrays.fill for SIMD-friendly operation
+                    for (int fillY = 0; fillY < height; fillY++) {
+                        data.skyLight[columnBase + fillY * area] = (byte) LucisConstants.MAX_LIGHT;
+                    }
+                    if (metrics) {
+                        oldSeedCandidates += height;
+                        openColumnsFast++;
+                    }
+                    // Entire column is uniform sky, no need to clear bits
+                    continue;
+                }
+                
+                // Standard path for columns with obstacles
                 for (; y >= 0; y--) {
                     int index = columnBase + y * area;
                     int opacity = data.opacity[index] & 0xF;
@@ -70,6 +95,9 @@ public final class LucisSkyLightEngine {
                     clearUniformBelow(uniformSky, data, x, z, y);
                 }
             }
+        }
+        if (metrics && openColumnsFast > 0) {
+            LucisBenchmarkSupport.count("lucis.sky.open_columns_fast", openColumnsFast);
         }
 
         data.markCoreSkySectionsDirty();

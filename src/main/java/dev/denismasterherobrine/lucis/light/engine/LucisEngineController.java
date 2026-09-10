@@ -58,6 +58,11 @@ public final class LucisEngineController {
     public CompletableFuture<LucisRelightResult> relightChunkAsync(LightChunkGetter getter, ChunkAccess chunk, boolean trustEdges) {
         ChunkPos chunkPos = chunk.getPos();
         pendingWorldgenTasks.incrementAndGet();
+        
+        // Prefetch neighbor chunks to reduce latency during extraction
+        // This warms up the chunk getter's cache and reduces waiting time
+        prefetchNeighborChunks(getter, chunkPos);
+        
         RegionLightData data;
         try {
             long extractStartedAt = LucisBenchmarkSupport.start();
@@ -79,6 +84,25 @@ public final class LucisEngineController {
             LucisBenchmarkSupport.recordSince("lucis.light_chunk.worker_compute", startedAt);
             return result;
         }, worldgenWorkers).whenComplete((result, throwable) -> pendingWorldgenTasks.decrementAndGet());
+    }
+    
+    private void prefetchNeighborChunks(LightChunkGetter getter, ChunkPos center) {
+        // Prefetch 8 neighbors (N, S, E, W, NE, NW, SE, SW) to reduce cache misses
+        // This is especially effective for worldgen where chunks are generated in sequence
+        int cx = center.x;
+        int cz = center.z;
+        
+        // Direct neighbors (N, S, E, W) - highest priority
+        getter.getChunkForLighting(cx + 1, cz);
+        getter.getChunkForLighting(cx - 1, cz);
+        getter.getChunkForLighting(cx, cz + 1);
+        getter.getChunkForLighting(cx, cz - 1);
+        
+        // Diagonal neighbors (NE, NW, SE, SW) - secondary priority
+        getter.getChunkForLighting(cx + 1, cz + 1);
+        getter.getChunkForLighting(cx + 1, cz - 1);
+        getter.getChunkForLighting(cx - 1, cz + 1);
+        getter.getChunkForLighting(cx - 1, cz - 1);
     }
 
     public LucisRelightResult relightAtBlock(LightChunkGetter getter, BlockPos pos) {
@@ -316,7 +340,7 @@ public final class LucisEngineController {
         if (configured > 0) {
             return configured;
         }
-        return Math.max(1, Math.min(available - 1, 6));
+        return Math.max(1, Math.min(available - 1, 12));
     }
 
     private static final class LucisWorldgenThreadFactory implements ThreadFactory {
