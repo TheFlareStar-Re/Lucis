@@ -105,6 +105,13 @@ neoForge {
             runConfig.systemProperty 'lucis.runtimeRegionChunks', providers.gradleProperty('lucisRuntimeRegionChunks').getOrElse('1')
             runConfig.systemProperty 'lucis.runtime.fullRelightChangeThreshold', providers.gradleProperty('lucisRuntimeFullRelightChangeThreshold').getOrElse('2048')
             runConfig.systemProperty 'lucis.runtime.fullRelightCoalesceNanos', providers.gradleProperty('lucisRuntimeFullRelightCoalesceNanos').getOrElse('5000000000')
+            runConfig.systemProperty 'lucis.experimentalSectionFastPath', providers.gradleProperty('lucisExperimentalSectionFastPath').getOrElse('true')
+            runConfig.systemProperty 'lucis.experimentalSkySeedSkip', providers.gradleProperty('lucisExperimentalSkySeedSkip').getOrElse('true')
+            runConfig.systemProperty 'lucis.experimentalDenseIncremental', providers.gradleProperty('lucisExperimentalDenseIncremental').getOrElse('true')
+            runConfig.systemProperty 'lucis.experimentalInlineRuntime', providers.gradleProperty('lucisExperimentalInlineRuntime').getOrElse('true')
+            runConfig.systemProperty 'lucis.experimentalRuntimeAdoption', providers.gradleProperty('lucisExperimentalRuntimeAdoption').getOrElse('true')
+            runConfig.systemProperty 'lucis.experimentalBoundaryDeltas', providers.gradleProperty('lucisExperimentalBoundaryDeltas').getOrElse('false')
+            runConfig.systemProperty 'lucis.publishCoalesceNanos', providers.gradleProperty('lucisPublishCoalesceNanos').getOrElse('250000')
             runConfig.systemProperty 'forge.logging.console.level', 'info'
             runConfig.jvmArgument '-Xmx2G'
         }

@@ -1,11 +1,15 @@
 package dev.denismasterherobrine.lucis.light.engine;
 
+import dev.denismasterherobrine.lucis.light.LucisConstants;
+import dev.denismasterherobrine.lucis.light.LucisFlags;
 import dev.denismasterherobrine.lucis.light.LightMaterial;
 import dev.denismasterherobrine.lucis.light.LightMaterialCache;
 import dev.denismasterherobrine.lucis.light.region.RegionBounds;
 import dev.denismasterherobrine.lucis.light.region.RegionLightData;
+import dev.denismasterherobrine.lucis.test.LucisBenchmarkSupport;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -115,13 +119,18 @@ public final class LucisRegionExtractor {
     }
 
     private void populateSectionCells(BlockGetter level, RegionLightData data, BlockPos.MutableBlockPos mutable,
-                                      LevelChunkSection section, int blockXStart, int blockXEnd, int blockYStart,
-                                      int blockYEnd, int blockZStart, int blockZEnd) {
+                                       LevelChunkSection section, int blockXStart, int blockXEnd, int blockYStart,
+                                       int blockYEnd, int blockZStart, int blockZEnd) {
         int minBlockX = data.bounds.minBlockX();
         int minBlockZ = data.bounds.minBlockZ();
         int minBuildY = data.bounds.minBuildY();
         int width = data.bounds.widthBlocks();
         int area = data.bounds.area();
+        if (LucisFlags.sectionFastPath && populateHomogeneousSection(data, section,
+                blockXStart - minBlockX, blockXEnd - minBlockX, blockYStart - minBuildY, blockYEnd - minBuildY,
+                blockZStart - minBlockZ, blockZEnd - minBlockZ, width, area)) {
+            return;
+        }
         for (int worldY = blockYStart; worldY < blockYEnd; worldY++) {
             int yBase = (worldY - minBuildY) * area;
             for (int worldZ = blockZStart; worldZ < blockZEnd; worldZ++) {
@@ -132,6 +141,38 @@ public final class LucisRegionExtractor {
                 }
             }
         }
+    }
+
+    /**
+     * Homogeneity-certified extraction: a section whose palette certifies a single light
+     * material class is bulk-filled instead of visited cell by cell. Air sections fill
+     * opacity/emission 0; sections whose every palette entry carries vanilla's cached
+     * full opacity and zero emission fill opacity 15. Both certificates are exact with
+     * respect to the per-cell material rules.
+     */
+    private boolean populateHomogeneousSection(RegionLightData data, LevelChunkSection section,
+                                               int localXStart, int localXEnd, int localYStart, int localYEnd,
+                                               int localZStart, int localZEnd, int width, int area) {
+        byte fillOpacity;
+        if (section.hasOnlyAir()) {
+            fillOpacity = 0;
+        } else if (section.maybeHas(state -> !(state.getLightBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) == 15
+                && state.getLightEmission() == 0))) {
+            return false;
+        } else {
+            fillOpacity = LucisConstants.MAX_LIGHT_BYTE;
+        }
+
+        LucisBenchmarkSupport.count(fillOpacity == 0 ? "lucis.extract.sections.air" : "lucis.extract.sections.opaque");
+        for (int localY = localYStart; localY < localYEnd; localY++) {
+            int yBase = localY * area;
+            for (int localZ = localZStart; localZ < localZEnd; localZ++) {
+                int rowBase = yBase + localZ * width;
+                java.util.Arrays.fill(data.emission, rowBase + localXStart, rowBase + localXEnd, (byte) 0);
+                java.util.Arrays.fill(data.opacity, rowBase + localXStart, rowBase + localXEnd, fillOpacity);
+            }
+        }
+        return true;
     }
 
     private void populateFallback(BlockGetter level, RegionLightData data, BlockPos.MutableBlockPos mutable,

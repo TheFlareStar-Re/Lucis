@@ -2,6 +2,7 @@ package dev.denismasterherobrine.lucis.light.engine;
 
 import dev.denismasterherobrine.lucis.light.LucisConstants;
 import dev.denismasterherobrine.lucis.light.LightMaterial;
+import dev.denismasterherobrine.lucis.light.reference.ReferenceLightEngine;
 import dev.denismasterherobrine.lucis.light.region.RegionBounds;
 import dev.denismasterherobrine.lucis.light.region.RegionLightData;
 import dev.denismasterherobrine.lucis.light.runtime.RuntimeLightChangeBuffer;
@@ -99,20 +100,31 @@ class LucisSkyLightEngineTest {
         LucisSkyLightEngine engine = new LucisSkyLightEngine();
         engine.compute(data);
 
+        RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer((ROOF_MAX - ROOF_MIN + 1) * (ROOF_MAX - ROOF_MIN + 1));
         for (int z = ROOF_MIN; z <= ROOF_MAX; z++) {
             for (int x = ROOF_MIN; x <= ROOF_MAX; x++) {
-                data.opacity[data.localIndex(x, ROOF_Y, z)] = LucisConstants.MAX_LIGHT_BYTE;
+                int index = data.localIndex(x, ROOF_Y, z);
+                data.opacity[index] = LucisConstants.MAX_LIGHT_BYTE;
+                changes.addLight(index, LightMaterial.packLight(0, 0),
+                        LightMaterial.packLight(LucisConstants.MAX_LIGHT, 0));
             }
         }
 
-        RuntimeLightChangeBuffer changes = applyRoofOpacity(data, 20, 21, 20, 21, LucisConstants.MAX_LIGHT);
-
         engine.applyRuntimeChanges(data, changes);
 
-        assertEquals(0, sky(data, 21, LEAF_Y, 21));
-        assertEquals(0, sky(data, 21, DEEP_Y, 21));
-        assertEquals(0, sky(data, 35, LEAF_Y, 35));
-        assertEquals(0, sky(data, 35, DEEP_Y, 35));
+        ReferenceLightEngine vanilla = referenceModel(data);
+        assertEquals(vanilla.skyLight[vanilla.index(21, LEAF_Y, 21)] & 0xF, sky(data, 21, LEAF_Y, 21));
+        assertEquals(vanilla.skyLight[vanilla.index(21, DEEP_Y, 21)] & 0xF, sky(data, 21, DEEP_Y, 21));
+        assertEquals(vanilla.skyLight[vanilla.index(35, LEAF_Y, 35)] & 0xF, sky(data, 35, LEAF_Y, 35));
+        assertEquals(vanilla.skyLight[vanilla.index(35, DEEP_Y, 35)] & 0xF, sky(data, 35, DEEP_Y, 35));
+        assertTrue(data.dirtySkySections.get(data.sectionLinearIndexLocal(21, LEAF_Y, 21)));
+    }
+
+    private static ReferenceLightEngine referenceModel(RegionLightData data) {
+        ReferenceLightEngine reference = new ReferenceLightEngine(data.bounds.widthBlocks(), data.bounds.depthBlocks(),
+                data.bounds.heightBlocks(), data.opacity, data.emission);
+        reference.recompute();
+        return reference;
     }
 
     @Test
@@ -167,16 +179,11 @@ class LucisSkyLightEngineTest {
 
         LucisSkyLightEngine engine = new LucisSkyLightEngine();
         engine.compute(data);
+        RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer((roofMax - roofMin + 1) * (roofMax - roofMin + 1) + 4);
         for (int z = roofMin; z <= roofMax; z++) {
             for (int x = roofMin; x <= roofMax; x++) {
-                data.opacity[data.localIndex(x, roofY, z)] = LucisConstants.MAX_LIGHT_BYTE;
-            }
-        }
-
-        RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer(4);
-        for (int z = 31; z <= 32; z++) {
-            for (int x = 31; x <= 32; x++) {
                 int index = data.localIndex(x, roofY, z);
+                data.opacity[index] = LucisConstants.MAX_LIGHT_BYTE;
                 changes.addLight(index, LightMaterial.packLight(0, 0),
                         LightMaterial.packLight(LucisConstants.MAX_LIGHT, 0));
             }
@@ -184,8 +191,9 @@ class LucisSkyLightEngineTest {
 
         engine.applyRuntimeChanges(data, changes);
 
-        assertEquals(0, sky(data, 52, leafY, 52));
-        assertEquals(0, sky(data, 52, deepY, 52));
+        ReferenceLightEngine vanilla = referenceModel(data);
+        assertEquals(vanilla.skyLight[vanilla.index(52, leafY, 52)] & 0xF, sky(data, 52, leafY, 52));
+        assertEquals(vanilla.skyLight[vanilla.index(52, deepY, 52)] & 0xF, sky(data, 52, deepY, 52));
     }
 
     private static RegionLightData newRegionData() {

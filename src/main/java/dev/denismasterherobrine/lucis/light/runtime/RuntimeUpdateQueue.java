@@ -3,7 +3,9 @@ package dev.denismasterherobrine.lucis.light.runtime;
 import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -45,6 +47,15 @@ public final class RuntimeUpdateQueue {
         PendingRegion pending = pendingByRegion.computeIfAbsent(regionKey, ignored -> new PendingRegion());
         int queued = pending.enqueueFullRelight(originalChangeCount);
         pendingCount.addAndGet(queued);
+    }
+
+    public void enqueueBoundaryDeltas(long regionKey, long[] deltas) {
+        if (deltas == null || deltas.length == 0) {
+            return;
+        }
+        PendingRegion pending = pendingByRegion.computeIfAbsent(regionKey, ignored -> new PendingRegion());
+        pending.enqueueDeltas(deltas);
+        pendingCount.addAndGet(deltas.length);
     }
 
     public boolean hasFullRelight(long regionKey) {
@@ -91,7 +102,20 @@ public final class RuntimeUpdateQueue {
         ArrayList<BlockChangeRecord> merged = new ArrayList<>(first.queuedChangeCount() + second.queuedChangeCount());
         merged.addAll(first.changes());
         merged.addAll(second.changes());
-        return new RuntimeRegionBatch(merged, false, first.originalChangeCount() + second.originalChangeCount());
+        long[] deltas = mergeDeltas(first.boundaryDeltas(), second.boundaryDeltas());
+        return new RuntimeRegionBatch(merged, false, first.originalChangeCount() + second.originalChangeCount(), deltas);
+    }
+
+    private static long[] mergeDeltas(long[] first, long[] second) {
+        if (first == null || first.length == 0) {
+            return second;
+        }
+        if (second == null || second.length == 0) {
+            return first;
+        }
+        long[] merged = Arrays.copyOf(first, first.length + second.length);
+        System.arraycopy(second, 0, merged, first.length, second.length);
+        return merged;
     }
 
     private record DrainedRegion(RuntimeRegionBatch batch, int reservations) {
@@ -99,9 +123,11 @@ public final class RuntimeUpdateQueue {
 
     private static final class PendingRegion {
         private final HashMap<Long, BlockChangeRecord> changes = new HashMap<>();
+        private LongArrayDeltas deltas;
         private boolean fullRelight;
         private long originalChangeCount;
         private int reservations;
+        private int deltaCount;
 
         private synchronized void enqueue(int x, int y, int z, BlockState oldState, BlockState newState, int fullRelightChangeThreshold) {
             originalChangeCount++;
@@ -114,6 +140,15 @@ public final class RuntimeUpdateQueue {
                 fullRelight = true;
                 changes.clear();
             }
+        }
+
+        private synchronized void enqueueDeltas(long[] incoming) {
+            if (deltas == null) {
+                deltas = new LongArrayDeltas(incoming);
+            } else {
+                deltas.append(incoming);
+            }
+            deltaCount += incoming.length;
         }
 
         private synchronized int enqueueFullRelight(long changes) {
@@ -134,23 +169,55 @@ public final class RuntimeUpdateQueue {
 
         private synchronized DrainedRegion drain() {
             int drainedReservations = reservations;
+            int drainedDeltaCount = deltaCount;
             reservations = 0;
+            deltaCount = 0;
+            long[] drainedDeltas = deltas == null ? null : deltas.take();
             if (fullRelight) {
-                RuntimeRegionBatch batch = RuntimeRegionBatch.fullRelight(originalChangeCount);
+                RuntimeRegionBatch batch = new RuntimeRegionBatch(List.of(), true, originalChangeCount, drainedDeltas);
                 fullRelight = false;
                 originalChangeCount = 0L;
                 changes.clear();
-                return new DrainedRegion(batch, drainedReservations);
+                return new DrainedRegion(batch, drainedReservations + drainedDeltaCount);
             }
             ArrayList<BlockChangeRecord> drained = new ArrayList<>(changes.values());
             changes.clear();
             long drainedOriginalChangeCount = originalChangeCount;
             originalChangeCount = 0L;
-            return new DrainedRegion(new RuntimeRegionBatch(drained, false, drainedOriginalChangeCount), drainedReservations);
+            return new DrainedRegion(new RuntimeRegionBatch(drained, false, drainedOriginalChangeCount, drainedDeltas),
+                    drainedReservations + drainedDeltaCount);
         }
 
         private static long blockKey(int x, int y, int z) {
             return (((long) x & 0x3ffffffL) << 38) | (((long) z & 0x3ffffffL) << 12) | (y & 0xfffL);
+        }
+    }
+
+    private static final class LongArrayDeltas {
+        private long[] data;
+        private int size;
+
+        private LongArrayDeltas(long[] initial) {
+            data = initial.clone();
+            size = initial.length;
+        }
+
+        private void append(long[] incoming) {
+            if (size + incoming.length > data.length) {
+                data = Arrays.copyOf(data, Math.max(size + incoming.length, data.length << 1));
+            }
+            System.arraycopy(incoming, 0, data, size, incoming.length);
+            size += incoming.length;
+        }
+
+        private long[] take() {
+            if (size == 0) {
+                return null;
+            }
+            long[] out = size == data.length ? data : Arrays.copyOf(data, size);
+            data = new long[0];
+            size = 0;
+            return out;
         }
     }
 }

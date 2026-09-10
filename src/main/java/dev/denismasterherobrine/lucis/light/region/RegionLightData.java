@@ -164,6 +164,29 @@ public final class RegionLightData {
         dirtySkySections.clear();
     }
 
+    /**
+     * Unpacks one 16x16x16 vanilla DataLayer (2048 packed nibbles) into this region's
+     * per-byte light array. Used by the adoption path to mirror the authoritative
+     * engine storage without recomputing light.
+     */
+    public void adoptSectionData(int localChunkX, int localChunkZ, int sectionIndex, byte[] packed, boolean sky) {
+        int minSectionBaseX = localChunkX << 4;
+        int minSectionBaseZ = localChunkZ << 4;
+        int width = bounds.widthBlocks();
+        int area = bounds.area();
+        byte[] target = sky ? skyLight : blockLight;
+        for (int y = 0; y < 16; y++) {
+            int yBase = (sectionIndex << 4 | y) * area;
+            for (int z = 0; z < 16; z++) {
+                int rowBase = yBase + (minSectionBaseZ + z) * width + minSectionBaseX;
+                int packedBase = (y << 8) | (z << 4);
+                for (int x = 0; x < 16; x++) {
+                    target[rowBase + x] = (byte) (x % 2 == 0 ? packed[(packedBase | x) >> 1] & 0xF : (packed[(packedBase | x) >> 1] >> 4) & 0xF);
+                }
+            }
+        }
+    }
+
     public void beginFullPopulate() {
         clearDirty();
     }

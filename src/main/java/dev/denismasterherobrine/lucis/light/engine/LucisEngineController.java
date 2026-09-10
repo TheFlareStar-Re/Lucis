@@ -4,6 +4,7 @@ import dev.denismasterherobrine.lucis.compat.LucisCompat;
 import dev.denismasterherobrine.lucis.config.LucisConfig;
 import dev.denismasterherobrine.lucis.light.LightMaterial;
 import dev.denismasterherobrine.lucis.light.LightMaterialCache;
+import dev.denismasterherobrine.lucis.light.LucisFlags;
 import dev.denismasterherobrine.lucis.light.region.RegionBounds;
 import dev.denismasterherobrine.lucis.light.region.RegionLightData;
 import dev.denismasterherobrine.lucis.light.runtime.LucisRelightResult;

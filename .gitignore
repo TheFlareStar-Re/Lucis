@@ -119,4 +119,5 @@ runs/
 !gradle-wrapper.jar
 
 /run*
-/docs
+/docs/benchmark-scratch/
+/benchmark-runs

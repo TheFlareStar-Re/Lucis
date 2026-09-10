@@ -34,37 +34,28 @@ The main technical quirk is that we still need to respect Minecraft's chunk stat
 
 ## Benchmarks
 
-First benchmark was run on Minecraft `1.21.1` with NeoForge `21.1.234`, comparing Vanilla, ScalableLux and Lucis on the same benchmark harness such as seed, coordinates and environment. Loaded spawn in radius of 3 chunks, 36 calculated chunks total.
+Reproducible benchmark methodology and results live in
+[docs/light-engine-profiling-and-results.md](docs/light-engine-profiling-and-results.md);
+architecture and design rationale in
+[docs/light-engine-architecture.md](docs/light-engine-architecture.md); the
+correctness contract in
+[docs/light-engine-correctness-contract.md](docs/light-engine-correctness-contract.md).
 
-Tested on AMD Ryzen 3700x with 4 threads delegated to Lucis.
+In short, on the current strict (vanilla-equivalent) path with the built-in harness
+(fresh JVM per run, strict drain barriers, identical seeds/coordinates):
 
-ScalableLux 0.1.0.1+neoforge.1cb1e91 left as by default with `parallelism=-1` in the config.
+| Workload | Vanilla ns/change | Lucis ns/change | Speedup |
+|---|---:|---:|---:|
+| `block_toggle_border` | 195,545 | 21,285 | 9.2x |
+| `dense_chunk_patch` | 8,376 | 1,931 | 4.3x |
+| `roof_toggle` | 9,450 | 1,926 | 4.9x |
+| `block_toggle_sparse` | 210,117 | 17,091 | 12.3x |
+| `edge_toggle` | 19,606 | 12,510 | 1.6x |
+| `sky_hole` | 98,197 | 99,868 | ~1.0x |
+| `structure_cube` 24³ (bulk) | 4,341 | 1,067 | 4.1x |
 
-Lower `ns/change` is better.
-
-| Workload | Vanilla ns/change | ScalableLux ns/change | Lucis ns/change | Lucis vs Vanilla | Lucis vs ScalableLux |
-|---|---:|---:|---:|---:|---:|
-| `block_toggle_border` | 322846.1 | 43999.7 | 28881.8 | 11.18x | 1.52x |
-| `dense_chunk_patch` | 17766.0 | 3480.5 | 3002.3 | 5.92x | 1.16x |
-| `edge_toggle` | 80824.9 | 26701.6 | 18182.0 | 4.45x | 1.47x |
-| `roof_toggle` | 22076.0 | 4680.8 | 2441.8 | 9.04x | 1.92x |
-| `sky_hole` | 213509.0 | 119023.0 | 114414.0 | 1.87x | 1.04x |
-
-Second benchmark was run on Minecraft `26.2` with NeoForge `26.2.0.1-beta`, comparing Vanilla, ScalableLux and Lucis on the same benchmark harness such as seed, coordinates and environment. Loaded spawn in radius of 3 chunks, 36 calculated chunks total.
-
-Tested on AMD Ryzen 3700x with 4 threads delegated to Lucis.
-
-ScalableLux 0.3.0-alpha.0.16+26.2 left as by default with `parallelism=-1` in the config.
-
-Lower `ns/change` is better.
-
-| Workload | Vanilla ns/change | ScalableLux ns/change | Lucis ns/change | Lucis vs Vanilla | Lucis vs ScalableLux |
-|---|---:|---:|---:|---:|---:|
-| `block_toggle_border` | 208909.3 | 165328.8 | 20695.4 | 10.09x | 7.99x |
-| `dense_chunk_patch` | 10319.5 | 3608.4 | 2221.0 | 4.65x | 1.62x |
-| `edge_toggle` | 26914.0 | 31825.3 | 21074.7 | 1.28x | 1.51x |
-| `roof_toggle` | 15469.0 | 8405.7 | 2398.7 | 6.45x | 3.50x |
-| `sky_hole` | 110073.3 | 112749.3 | 85347.3 | 1.29x | 1.32x |
+Earlier benchmark tables that used to live here came from a different harness state and
+are superseded by the document above; do not quote them.
 
 ## Compatibility
 

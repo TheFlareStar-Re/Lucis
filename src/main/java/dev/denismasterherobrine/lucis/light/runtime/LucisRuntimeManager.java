@@ -1,6 +1,7 @@
 package dev.denismasterherobrine.lucis.light.runtime;
 
 import dev.denismasterherobrine.lucis.config.LucisConfig;
+import dev.denismasterherobrine.lucis.light.LucisFlags;
 import dev.denismasterherobrine.lucis.light.engine.LucisRelighter;
 import dev.denismasterherobrine.lucis.light.region.OwnedRegionCache;
 import dev.denismasterherobrine.lucis.light.region.RegionBounds;
@@ -26,11 +27,16 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class LucisRuntimeManager implements AutoCloseable {
     private static final int MAX_RUNTIME_REGION_SUBMITS_PER_TICK = Integer.getInteger("lucis.runtime.maxSubmitsPerTick", 0);
     private static final int MAX_RUNTIME_PENDING_RECORDS = Integer.getInteger("lucis.runtime.maxPendingRecords", 131_072);
-    private static final int FULL_RELIGHT_CHANGE_THRESHOLD = Integer.getInteger("lucis.runtime.fullRelightChangeThreshold", 2048);
     private static final long FULL_RELIGHT_COALESCE_NANOS = Long.getLong("lucis.runtime.fullRelightCoalesceNanos", 5_000_000_000L);
     private static final int RUNTIME_REGION_CHUNKS = Math.max(1, Math.min(Integer.getInteger("lucis.runtimeRegionChunks", 1), 16));
 
-    private final RuntimeUpdateQueue updateQueue = new RuntimeUpdateQueue(MAX_RUNTIME_PENDING_RECORDS, FULL_RELIGHT_CHANGE_THRESHOLD);
+    // With dense-incremental routing, record-backed batches never degrade into full
+    // relights; only the explicit bulk-write path (which carries no records) does.
+    private final int fullRelightChangeThreshold = LucisFlags.denseIncremental
+            ? Integer.MAX_VALUE
+            : Math.max(1, Integer.getInteger("lucis.runtime.fullRelightChangeThreshold", 2048));
+
+    private final RuntimeUpdateQueue updateQueue = new RuntimeUpdateQueue(MAX_RUNTIME_PENDING_RECORDS, fullRelightChangeThreshold);
     private final RegionOwnerTable ownerTable = new RegionOwnerTable();
     private final OwnedRegionCache regionCache = new OwnedRegionCache();
     private final LucisScheduler scheduler = new LucisScheduler(runtimeWorkerCount());
@@ -73,6 +79,13 @@ public final class LucisRuntimeManager implements AutoCloseable {
         return true;
     }
 
+    public void enqueueBoundaryDeltas(long regionKey, long[] deltas) {
+        if (closed || deltas == null || deltas.length == 0) {
+            return;
+        }
+        updateQueue.enqueueBoundaryDeltas(regionKey, deltas);
+    }
+
     public boolean canAcceptMoreWork() {
         return !closed && updateQueue.hasCapacity();
     }
@@ -82,7 +95,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
         if (closed) {
             return;
         }
-        scheduleQueuedRegions(getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
+        scheduleQueuedRegions(lightEngine, getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
         flushCommits(lightEngine);
         regionCache.trimToSize(LucisConfig.maxCachedRegions);
     }
@@ -94,7 +107,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
                 || scheduler.hasPendingWork();
     }
 
-    private void scheduleQueuedRegions(LightChunkGetter getter, LucisRelighter relighter,
+    private void scheduleQueuedRegions(ThreadedLevelLightEngine lightEngine, LightChunkGetter getter, LucisRelighter relighter,
                                        int regionChunks, int haloChunks, boolean enableSky, boolean enableBlock) {
         if (updateQueue.isEmpty() && pendingBatchesEmpty()) {
             return;
@@ -131,7 +144,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
 
         for (ScheduledRegionBatch batch : selected) {
-            scheduleRegion(batch.regionKey(), batch.batch(), getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
+            scheduleRegion(lightEngine, batch.regionKey(), batch.batch(), getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
         }
     }
 
@@ -141,7 +154,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
     }
 
-    private void scheduleRegion(long regionKey, RuntimeRegionBatch batch, LightChunkGetter getter,
+    private void scheduleRegion(ThreadedLevelLightEngine lightEngine, long regionKey, RuntimeRegionBatch batch, LightChunkGetter getter,
                                 LucisRelighter relighter, int regionChunks, int haloChunks, boolean enableSky, boolean enableBlock) {
         if (closed) {
             requeue(regionKey, batch);
@@ -173,6 +186,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
         HashMap<Long, LightChunk> expectedChunks = captureExpectedChunks(getter, bounds);
         RuntimeRegionState ownedState = regionCache.getOrCreate(bounds);
         ownedState.touch();
+        boolean inlinePublish = LucisFlags.inlineRuntime;
         LucisBenchmarkSupport.count("lucis.runtime.jobs.runtime.submit");
         LucisBenchmarkSupport.count(batch.fullRelight() ? "lucis.runtime.jobs.fullRelight" : "lucis.runtime.jobs.incremental");
         LucisBenchmarkSupport.count("lucis.runtime.jobs.changeRecords", batch.queuedChangeCount());
@@ -180,11 +194,25 @@ public final class LucisRuntimeManager implements AutoCloseable {
             long jobStartedAt = LucisBenchmarkSupport.start();
             try {
                 List<LucisRelightResult> results = relighter.relightRuntimeRegion(getter, ownedState, coreChunk,
-                        batch, enableSky, enableBlock);
+                        batch, enableSky, enableBlock, this::enqueueBoundaryDeltas);
                 if (closed) {
                     return;
                 }
                 LucisBenchmarkSupport.count("lucis.runtime.jobs.results", results.size());
+                if (inlinePublish) {
+                    LucisLightPublisher publisher = (LucisLightPublisher) lightEngine;
+                    for (LucisRelightResult result : results) {
+                        LucisBenchmarkSupport.count("lucis.runtime.jobs.sections", result.sections().size());
+                        LightChunk expectedChunk = expectedChunks.get(ChunkPos.asLong(result.chunkPos().x, result.chunkPos().z));
+                        if (expectedChunk == null) {
+                            LucisBenchmarkSupport.count("lucis.runtime.commit.skippedMissingExpectedChunk");
+                            continue;
+                        }
+                        publisher.lucis$publish(result, expectedChunk);
+                    }
+                    lightEngine.tryScheduleUpdate();
+                    return;
+                }
                 for (LucisRelightResult result : results) {
                     LucisBenchmarkSupport.count("lucis.runtime.jobs.sections", result.sections().size());
                     LightChunk expectedChunk = expectedChunks.get(ChunkPos.asLong(result.chunkPos().x, result.chunkPos().z));
@@ -259,7 +287,17 @@ public final class LucisRuntimeManager implements AutoCloseable {
         ArrayList<BlockChangeRecord> merged = new ArrayList<>(existing.queuedChangeCount() + incoming.queuedChangeCount());
         merged.addAll(existing.changes());
         merged.addAll(incoming.changes());
-        return new RuntimeRegionBatch(merged, false, existing.originalChangeCount() + incoming.originalChangeCount());
+        long[] deltas = existing.boundaryDeltas();
+        long[] incomingDeltas = incoming.boundaryDeltas();
+        if (deltas != null && incomingDeltas != null) {
+            long[] combined = new long[deltas.length + incomingDeltas.length];
+            System.arraycopy(deltas, 0, combined, 0, deltas.length);
+            System.arraycopy(incomingDeltas, 0, combined, deltas.length, incomingDeltas.length);
+            deltas = combined;
+        } else if (incomingDeltas != null) {
+            deltas = incomingDeltas;
+        }
+        return new RuntimeRegionBatch(merged, false, existing.originalChangeCount() + incoming.originalChangeCount(), deltas);
     }
 
     private void flushCommits(ThreadedLevelLightEngine lightEngine) {

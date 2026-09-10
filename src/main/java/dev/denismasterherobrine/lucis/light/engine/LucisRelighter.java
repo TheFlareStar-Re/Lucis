@@ -1,7 +1,9 @@
 package dev.denismasterherobrine.lucis.light.engine;
 
+import dev.denismasterherobrine.lucis.Lucis;
 import dev.denismasterherobrine.lucis.light.LightMaterial;
 import dev.denismasterherobrine.lucis.light.LightMaterialCache;
+import dev.denismasterherobrine.lucis.light.LucisFlags;
 import dev.denismasterherobrine.lucis.light.region.RegionBounds;
 import dev.denismasterherobrine.lucis.light.region.RegionLightData;
 import dev.denismasterherobrine.lucis.light.region.RuntimeRegionState;
@@ -27,10 +29,24 @@ public final class LucisRelighter {
     private final LucisPublishEngine publishEngine = new LucisPublishEngine();
     private final ThreadLocal<RuntimeLightChangeBuffer> runtimeChangeBuffers = ThreadLocal.withInitial(() -> new RuntimeLightChangeBuffer(256));
     private final ThreadLocal<BlockPos.MutableBlockPos> runtimeMaterialPos = ThreadLocal.withInitial(BlockPos.MutableBlockPos::new);
+    private final ThreadLocal<byte[]> borderScratch = ThreadLocal.withInitial(() -> new byte[0]);
+
+    /**
+     * Receives cross-region boundary light deltas produced by a region job.
+     */
+    public interface BoundaryDeltaSink extends BorderDeltaSupport.BoundaryDeltaSink {
+    }
 
     public LucisRelighter(LightMaterialCache materialCache, LucisRegionExtractor extractor) {
         this.materialCache = materialCache;
         this.extractor = extractor;
+    }
+
+    private BorderDeltaSupport.BoundaryDeltaSink sinkWrapper(BoundaryDeltaSink sink) {
+        return (neighborRegionKey, deltas) -> {
+            LucisBenchmarkSupport.count("lucis.runtime.boundary.deltas", deltas.length);
+            sink.accept(neighborRegionKey, deltas);
+        };
     }
 
     public LucisRelightResult relightChunk(LightChunkGetter getter, ChunkAccess chunk, boolean enableSky, boolean enableBlock,
@@ -89,7 +105,8 @@ public final class LucisRelighter {
     }
 
     public List<LucisRelightResult> relightRuntimeRegion(LightChunkGetter getter, RuntimeRegionState state, LightChunk coreChunk,
-                                                        RuntimeRegionBatch batch, boolean enableSky, boolean enableBlock) {
+                                                         RuntimeRegionBatch batch, boolean enableSky, boolean enableBlock,
+                                                         BoundaryDeltaSink deltaSink) {
         RegionLightData data = state.data();
         if (!state.initializedFor(coreChunk)) {
             LucisBenchmarkSupport.count(state.initialized()
@@ -98,6 +115,16 @@ public final class LucisRelighter {
             long startedAt = LucisBenchmarkSupport.start();
             extractor.populate(getter, data, coreChunk);
             LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.extract", startedAt);
+            if (LucisFlags.runtimeAdoption && adoptEngineLight(getter, data, coreChunk)) {
+                LucisBenchmarkSupport.count("lucis.runtime.region.adopted");
+                applyIncomingBoundaryDeltas(data, batch, enableSky, enableBlock);
+                state.markInitialized(coreChunk);
+                List<LucisRelightResult> results = publishEngine.publishRegion(data);
+                countPublished("lucis.runtime.init", results);
+                data.clearDirty();
+                return results;
+            }
+            byte[] borderBefore = deltaSink != null && LucisFlags.boundaryDeltas ? BorderDeltaSupport.snapshotBorder(data, borderScratch.get()) : null;
             startedAt = LucisBenchmarkSupport.start();
             if (enableSky) {
                 skyLightEngine.compute(data);
@@ -113,12 +140,16 @@ public final class LucisRelighter {
             List<LucisRelightResult> results = publishEngine.publishRegion(data);
             LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.publish", startedAt);
             countPublished("lucis.runtime.init", results);
+            if (borderBefore != null) {
+            BorderDeltaSupport.emitBoundaryDeltas(data, borderBefore, sinkWrapper(deltaSink));
+        }
             data.clearDirty();
             return results;
         }
 
         if (batch.fullRelight()) {
             LucisBenchmarkSupport.count("lucis.runtime.region.fullRelight");
+            byte[] borderBefore = deltaSink != null && LucisFlags.boundaryDeltas ? BorderDeltaSupport.snapshotBorder(data, borderScratch.get()) : null;
             long startedAt = LucisBenchmarkSupport.start();
             extractor.populate(getter, data, coreChunk);
             LucisBenchmarkSupport.recordSince("lucis.stage.runtime.full.extract", startedAt);
@@ -136,19 +167,24 @@ public final class LucisRelighter {
             List<LucisRelightResult> results = publishEngine.publishRegion(data);
             LucisBenchmarkSupport.recordSince("lucis.stage.runtime.full.publish", startedAt);
             countPublished("lucis.runtime.full", results);
+            if (borderBefore != null) {
+            BorderDeltaSupport.emitBoundaryDeltas(data, borderBefore, sinkWrapper(deltaSink));
+        }
             data.clearDirty();
             return results;
         }
 
         List<BlockChangeRecord> changes = batch.changes();
+        boolean hasDeltas = !batch.isEmptyDeltaSet();
 
-        if (changes.isEmpty()) {
+        if (changes.isEmpty() && !hasDeltas) {
             return List.of();
         }
 
         LucisBenchmarkSupport.count("lucis.runtime.region.incremental");
         LucisBenchmarkSupport.count("lucis.runtime.change.records", changes.size());
         data.clearDirty();
+        byte[] borderBefore = deltaSink != null && LucisFlags.boundaryDeltas ? BorderDeltaSupport.snapshotBorder(data, borderScratch.get()) : null;
         long startedAt = LucisBenchmarkSupport.start();
         RuntimeLightChangeBuffer runtimeChanges = runtimeChangeBuffers.get();
         runtimeChanges.clear();
@@ -157,7 +193,14 @@ public final class LucisRelighter {
         if (runtimeChanges.isEmpty()) {
             LucisBenchmarkSupport.count("lucis.runtime.change.light_noop", changes.size());
             runtimeChanges.clear();
-            return List.of();
+            applyIncomingBoundaryDeltas(data, batch, enableSky, enableBlock);
+            List<LucisRelightResult> results = publishEngine.publishRegion(data);
+            countPublished("lucis.runtime.incremental", results);
+            if (borderBefore != null) {
+            BorderDeltaSupport.emitBoundaryDeltas(data, borderBefore, sinkWrapper(deltaSink));
+        }
+            data.clearDirty();
+            return results;
         }
         startedAt = LucisBenchmarkSupport.start();
         applyMaterialChanges(data, runtimeChanges);
@@ -189,12 +232,30 @@ public final class LucisRelighter {
         }
         LucisBenchmarkSupport.recordSince("lucis.stage.runtime.incremental.block", startedAt);
         startedAt = LucisBenchmarkSupport.start();
+        applyIncomingBoundaryDeltas(data, batch, enableSky, enableBlock);
+        LucisBenchmarkSupport.recordSince("lucis.stage.runtime.incremental.deltas", startedAt);
+        startedAt = LucisBenchmarkSupport.start();
         List<LucisRelightResult> results = publishEngine.publishRegion(data);
         LucisBenchmarkSupport.recordSince("lucis.stage.runtime.incremental.publish", startedAt);
         countPublished("lucis.runtime.incremental", results);
+        if (borderBefore != null) {
+            BorderDeltaSupport.emitBoundaryDeltas(data, borderBefore, sinkWrapper(deltaSink));
+        }
         data.clearDirty();
         runtimeChanges.clear();
         return results;
+    }
+
+    private void applyIncomingBoundaryDeltas(RegionLightData data, RuntimeRegionBatch batch, boolean enableSky, boolean enableBlock) {
+        if (batch.isEmptyDeltaSet() || !LucisFlags.boundaryDeltas) {
+            return;
+        }
+        if (enableSky) {
+            skyLightEngine.applyBoundaryDeltas(data, batch.boundaryDeltas());
+        }
+        if (enableBlock) {
+            blockLightEngine.applyBoundaryDeltas(data, batch.boundaryDeltas());
+        }
     }
 
     private void materializeChanges(BlockGetter level, RegionLightData data, List<BlockChangeRecord> changes, RuntimeLightChangeBuffer runtimeChanges) {
@@ -231,6 +292,59 @@ public final class LucisRelighter {
             data.opacity[index] = (byte) (newLight & 0xF);
             data.emission[index] = (byte) ((newLight >>> 4) & 0xF);
         }
+    }
+
+    /**
+     * Adoption-backed region initialization: instead of recomputing sky and block light
+     * from scratch, mirror the authoritative light already stored by the engine for this
+     * fully loaded chunk. The adopted state is exactly the observable state, so runtime
+     * edits can proceed incrementally with zero bootstrap light work and zero bootstrap
+     * publications. Returns false when adoption is not possible and the caller must fall
+     * back to a full compute.
+     */
+    private boolean adoptEngineLight(LightChunkGetter getter, RegionLightData data, LightChunk coreChunk) {
+        if (coreChunk instanceof ChunkAccess chunkAccess && !chunkAccess.isLightCorrect()) {
+            LucisBenchmarkSupport.count("lucis.runtime.region.adopt.skippedLightNotCorrect");
+            return false;
+        }
+        if (!(getter.getLevel() instanceof net.minecraft.world.level.Level level)) {
+            return false;
+        }
+        long startedAt = LucisBenchmarkSupport.start();
+        try {
+            net.minecraft.world.level.lighting.LevelLightEngine lightEngine = level.getLightEngine();
+            RegionBounds bounds = data.bounds;
+            int chunkCount = bounds.regionChunks() + bounds.haloChunks() * 2;
+            for (int sectionY = 0; sectionY < bounds.sectionCount(); sectionY++) {
+                for (int chunkZ = 0; chunkZ < chunkCount; chunkZ++) {
+                    for (int chunkX = 0; chunkX < chunkCount; chunkX++) {
+                        net.minecraft.core.SectionPos sectionPos = net.minecraft.core.SectionPos.of(
+                                bounds.originChunkX() - bounds.haloChunks() + chunkX,
+                                bounds.minSectionY() + sectionY,
+                                bounds.originChunkZ() - bounds.haloChunks() + chunkZ);
+                        adoptLayer(lightEngine, data, sectionPos, chunkX, chunkZ, sectionY, false);
+                        adoptLayer(lightEngine, data, sectionPos, chunkX, chunkZ, sectionY, true);
+                    }
+                }
+            }
+            LucisBenchmarkSupport.count("lucis.runtime.region.adopt.sections", chunkCount * chunkCount * bounds.sectionCount());
+        } catch (Throwable throwable) {
+            Lucis.LOGGER.debug("Lucis light adoption failed, falling back to full compute", throwable);
+            data.resetForReuse();
+            return false;
+        }
+        LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.adopt", startedAt);
+        return true;
+    }
+
+    private void adoptLayer(net.minecraft.world.level.lighting.LevelLightEngine lightEngine, RegionLightData data,
+                            net.minecraft.core.SectionPos sectionPos, int chunkX, int chunkZ, int sectionY, boolean sky) {
+        net.minecraft.world.level.LightLayer layer = sky ? net.minecraft.world.level.LightLayer.SKY : net.minecraft.world.level.LightLayer.BLOCK;
+        net.minecraft.world.level.chunk.DataLayer dataLayer = lightEngine.getLayerListener(layer).getDataLayerData(sectionPos);
+        if (dataLayer == null) {
+            return;
+        }
+        data.adoptSectionData(chunkX, chunkZ, sectionY, dataLayer.getData(), sky);
     }
 
     private boolean hasNearbyBlockLight(RegionLightData data, RuntimeLightChangeBuffer changes) {

@@ -1,6 +1,7 @@
 package dev.denismasterherobrine.lucis.config;
 
 import dev.denismasterherobrine.lucis.Lucis;
+import dev.denismasterherobrine.lucis.light.LucisFlags;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.ModLoadingContext;
@@ -57,6 +58,30 @@ public final class LucisConfig {
             .comment("Enable debug-only metrics and diagnostics")
             .define("debug", false);
 
+    private static final ModConfigSpec.BooleanValue SECTION_FAST_PATH = BUILDER
+            .comment("Skip per-cell material extraction for homogeneous sections (air / fully opaque)")
+            .define("experimentalSectionFastPath", true);
+
+    private static final ModConfigSpec.BooleanValue SKY_SEED_SKIP = BUILDER
+            .comment("Skip frontier seeding scans for sections that are uniformly lit skylight sources")
+            .define("experimentalSkySeedSkip", true);
+
+    private static final ModConfigSpec.BooleanValue DENSE_INCREMENTAL = BUILDER
+            .comment("Keep dense record-backed batches incremental instead of promoting them to full region relights")
+            .define("experimentalDenseIncremental", true);
+
+    private static final ModConfigSpec.BooleanValue INLINE_RUNTIME = BUILDER
+            .comment("Publish runtime light results directly from worker threads")
+            .define("experimentalInlineRuntime", true);
+
+    private static final ModConfigSpec.BooleanValue RUNTIME_ADOPTION = BUILDER
+            .comment("Adopt engine-stored light at region init instead of recomputing it")
+            .define("experimentalRuntimeAdoption", true);
+
+    private static final ModConfigSpec.BooleanValue BOUNDARY_DELTAS = BUILDER
+            .comment("Cross-region boundary light continuation (prototype, may oscillate)")
+            .define("experimentalBoundaryDeltas", false);
+
     public static final ModConfigSpec SPEC = BUILDER.build();
 
     public static boolean enabled = true;
@@ -70,6 +95,12 @@ public final class LucisConfig {
     public static boolean enableBlock = true;
     public static boolean verboseLogging = false;
     public static boolean debug = false;
+    public static boolean experimentalSectionFastPath = true;
+    public static boolean experimentalSkySeedSkip = true;
+    public static boolean experimentalDenseIncremental = true;
+    public static boolean experimentalInlineRuntime = true;
+    public static boolean experimentalRuntimeAdoption = true;
+    public static boolean experimentalBoundaryDeltas = false;
 
     private LucisConfig() {
     }
@@ -101,6 +132,12 @@ public final class LucisConfig {
         enableBlock = ENABLE_BLOCK.get();
         verboseLogging = VERBOSE_LOGGING.get();
         debug = DEBUG.get();
+        experimentalSectionFastPath = SECTION_FAST_PATH.get();
+        experimentalSkySeedSkip = SKY_SEED_SKIP.get();
+        experimentalDenseIncremental = DENSE_INCREMENTAL.get();
+        experimentalInlineRuntime = INLINE_RUNTIME.get();
+        experimentalRuntimeAdoption = RUNTIME_ADOPTION.get();
+        experimentalBoundaryDeltas = BOUNDARY_DELTAS.get();
         applyOverrides();
     }
 
@@ -112,6 +149,16 @@ public final class LucisConfig {
         enableBlock = overrideBoolean("lucis.enableBlock", enableBlock);
         verboseLogging = overrideBoolean("lucis.verboseLogging", verboseLogging);
         debug = overrideBoolean("lucis.debug", debug);
+        experimentalSectionFastPath = overrideBoolean("lucis.experimentalSectionFastPath", experimentalSectionFastPath);
+        experimentalSkySeedSkip = overrideBoolean("lucis.experimentalSkySeedSkip", experimentalSkySeedSkip);
+        experimentalDenseIncremental = overrideBoolean("lucis.experimentalDenseIncremental", experimentalDenseIncremental);
+        experimentalInlineRuntime = overrideBoolean("lucis.experimentalInlineRuntime", experimentalInlineRuntime);
+        experimentalRuntimeAdoption = overrideBoolean("lucis.experimentalRuntimeAdoption", experimentalRuntimeAdoption);
+        experimentalBoundaryDeltas = overrideBoolean("lucis.experimentalBoundaryDeltas", experimentalBoundaryDeltas);
+        LucisFlags.set(experimentalSectionFastPath, experimentalSkySeedSkip, experimentalDenseIncremental,
+                experimentalInlineRuntime);
+        LucisFlags.runtimeAdoption = experimentalRuntimeAdoption;
+        LucisFlags.boundaryDeltas = experimentalBoundaryDeltas;
         regionChunks = overrideInt("lucis.regionChunks", regionChunks);
         haloChunks = overrideInt("lucis.haloChunks", haloChunks);
         maxBatchChunks = overrideInt("lucis.maxBatchChunks", maxBatchChunks);

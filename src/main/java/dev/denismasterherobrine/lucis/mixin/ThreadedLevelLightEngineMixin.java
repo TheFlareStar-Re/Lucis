@@ -36,7 +36,8 @@ import java.util.function.IntSupplier;
 @Mixin(ThreadedLevelLightEngine.class)
 public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine implements LucisLightPublisher {
     @Unique
-    private static final long LUCIS_PUBLISH_COALESCE_NANOS = 250_000L;
+    private static final long LUCIS_PUBLISH_COALESCE_NANOS =
+            Math.max(0L, Long.getLong("lucis.publishCoalesceNanos", 250_000L));
 
     @Unique
     private LightChunkGetter lucis$chunkSource;
