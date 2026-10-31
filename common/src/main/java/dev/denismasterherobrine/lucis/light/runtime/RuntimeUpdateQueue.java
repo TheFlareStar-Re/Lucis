@@ -26,8 +26,13 @@ public final class RuntimeUpdateQueue {
             pendingCount.decrementAndGet();
             return false;
         }
-        PendingRegion pending = pendingByRegion.computeIfAbsent(regionKey, ignored -> new PendingRegion());
-        pending.enqueue(x, y, z, oldState, newState, fullRelightChangeThreshold);
+        pendingByRegion.compute(regionKey, (key, pending) -> {
+            if (pending == null) {
+                pending = new PendingRegion();
+            }
+            pending.enqueue(x, y, z, oldState, newState, fullRelightChangeThreshold);
+            return pending;
+        });
         return true;
     }
 
@@ -42,9 +47,13 @@ public final class RuntimeUpdateQueue {
     }
 
     public void enqueueFullRelight(long regionKey, long originalChangeCount) {
-        PendingRegion pending = pendingByRegion.computeIfAbsent(regionKey, ignored -> new PendingRegion());
-        int queued = pending.enqueueFullRelight(originalChangeCount);
-        pendingCount.addAndGet(queued);
+        pendingByRegion.compute(regionKey, (key, pending) -> {
+            if (pending == null) {
+                pending = new PendingRegion();
+            }
+            pendingCount.addAndGet(pending.enqueueFullRelight(originalChangeCount));
+            return pending;
+        });
     }
 
     public boolean hasFullRelight(long regionKey) {

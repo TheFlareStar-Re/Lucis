@@ -154,6 +154,7 @@ public final class LucisRegionExtractor {
                                BlockState state, int worldX, int worldY, int worldZ, int index) {
         mutable.set(worldX, worldY, worldZ);
         int material = materialCache.lookupLight(level, state, mutable);
+        data.materials[index] = (short) material;
         data.opacity[index] = LightMaterial.opacity(material);
         data.emission[index] = LightMaterial.emission(material);
     }

@@ -11,7 +11,6 @@ import dev.denismasterherobrine.lucis.light.runtime.RuntimeRegionBatch;
 import dev.denismasterherobrine.lucis.light.runtime.RuntimeLightChangeBuffer;
 import dev.denismasterherobrine.lucis.test.LucisBenchmarkSupport;
 import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LightChunk;
@@ -25,7 +24,6 @@ public final class LucisRelighter {
     private final LucisSkyLightEngine skyLightEngine = new LucisSkyLightEngine();
     private final LucisBlockLightEngine blockLightEngine = new LucisBlockLightEngine();
     private final LucisPublishEngine publishEngine = new LucisPublishEngine();
-    private final ThreadLocal<RuntimeLightChangeBuffer> runtimeChangeBuffers = ThreadLocal.withInitial(() -> new RuntimeLightChangeBuffer(256));
     private final ThreadLocal<BlockPos.MutableBlockPos> runtimeMaterialPos = ThreadLocal.withInitial(BlockPos.MutableBlockPos::new);
 
     public LucisRelighter(LightMaterialCache materialCache, LucisRegionExtractor extractor) {
@@ -88,78 +86,45 @@ public final class LucisRelighter {
         return results;
     }
 
-    public List<LucisRelightResult> relightRuntimeRegion(LightChunkGetter getter, RuntimeRegionState state, LightChunk coreChunk,
-                                                        RuntimeRegionBatch batch, boolean enableSky, boolean enableBlock) {
+    public PreparedRuntimeRegion prepareRuntimeRegion(LightChunkGetter getter, RuntimeRegionState state,
+                                                       LightChunk coreChunk, RuntimeRegionBatch batch,
+                                                       java.util.Map<Long, LightChunk> sources) {
         RegionLightData data = state.data();
-        if (!state.initializedFor(coreChunk)) {
-            LucisBenchmarkSupport.count(state.initialized()
-                    ? "lucis.runtime.region.reload"
-                    : "lucis.runtime.region.init");
-            long startedAt = LucisBenchmarkSupport.start();
+        boolean full = batch.fullRelight() || !state.initializedForSources(sources);
+        RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer(batch.queuedChangeCount());
+        if (full) {
             extractor.populate(getter, data, coreChunk);
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.extract", startedAt);
-            startedAt = LucisBenchmarkSupport.start();
+        } else {
+            materializeChanges(getter, data, batch.changes(), changes);
+        }
+        return new PreparedRuntimeRegion(state, coreChunk, sources, changes, full, state.epoch());
+    }
+
+    public List<LucisRelightResult> relightPreparedRuntimeRegion(PreparedRuntimeRegion prepared,
+                                                               boolean enableSky, boolean enableBlock) {
+        RuntimeRegionState state = prepared.state();
+        RegionLightData data = state.data();
+        if (prepared.full()) {
             if (enableSky) {
                 skyLightEngine.compute(data);
             }
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.sky", startedAt);
-            startedAt = LucisBenchmarkSupport.start();
             if (enableBlock) {
                 blockLightEngine.compute(data);
             }
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.block", startedAt);
-            state.markInitialized(coreChunk);
-            startedAt = LucisBenchmarkSupport.start();
+            state.complete(prepared.epoch(), prepared.coreChunk(), prepared.sources());
             List<LucisRelightResult> results = publishEngine.publishRegion(data);
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.init.publish", startedAt);
-            countPublished("lucis.runtime.init", results);
             data.clearDirty();
             return results;
         }
 
-        if (batch.fullRelight()) {
-            LucisBenchmarkSupport.count("lucis.runtime.region.fullRelight");
-            long startedAt = LucisBenchmarkSupport.start();
-            extractor.populate(getter, data, coreChunk);
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.full.extract", startedAt);
-            startedAt = LucisBenchmarkSupport.start();
-            if (enableSky) {
-                skyLightEngine.compute(data);
-            }
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.full.sky", startedAt);
-            startedAt = LucisBenchmarkSupport.start();
-            if (enableBlock) {
-                blockLightEngine.compute(data);
-            }
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.full.block", startedAt);
-            startedAt = LucisBenchmarkSupport.start();
-            List<LucisRelightResult> results = publishEngine.publishRegion(data);
-            LucisBenchmarkSupport.recordSince("lucis.stage.runtime.full.publish", startedAt);
-            countPublished("lucis.runtime.full", results);
-            data.clearDirty();
-            return results;
-        }
-
-        List<BlockChangeRecord> changes = batch.changes();
-
-        if (changes.isEmpty()) {
+        RuntimeLightChangeBuffer runtimeChanges = prepared.changes();
+        if (runtimeChanges.isEmpty()) {
             return List.of();
         }
-
         LucisBenchmarkSupport.count("lucis.runtime.region.incremental");
-        LucisBenchmarkSupport.count("lucis.runtime.change.records", changes.size());
+        LucisBenchmarkSupport.count("lucis.runtime.change.records", runtimeChanges.size());
         data.clearDirty();
         long startedAt = LucisBenchmarkSupport.start();
-        RuntimeLightChangeBuffer runtimeChanges = runtimeChangeBuffers.get();
-        runtimeChanges.clear();
-        materializeChanges(getter.getLevel(), data, changes, runtimeChanges);
-        LucisBenchmarkSupport.recordSince("lucis.stage.runtime.incremental.materialize", startedAt);
-        if (runtimeChanges.isEmpty()) {
-            LucisBenchmarkSupport.count("lucis.runtime.change.light_noop", changes.size());
-            runtimeChanges.clear();
-            return List.of();
-        }
-        startedAt = LucisBenchmarkSupport.start();
         applyMaterialChanges(data, runtimeChanges);
         LucisBenchmarkSupport.recordSince("lucis.stage.runtime.incremental.materials", startedAt);
         startedAt = LucisBenchmarkSupport.start();
@@ -197,7 +162,7 @@ public final class LucisRelighter {
         return results;
     }
 
-    private void materializeChanges(BlockGetter level, RegionLightData data, List<BlockChangeRecord> changes, RuntimeLightChangeBuffer runtimeChanges) {
+    private void materializeChanges(LightChunkGetter getter, RegionLightData data, List<BlockChangeRecord> changes, RuntimeLightChangeBuffer runtimeChanges) {
         BlockPos.MutableBlockPos pos = runtimeMaterialPos.get();
         RegionBounds bounds = data.bounds;
         int minBlockX = bounds.minBlockX();
@@ -206,7 +171,11 @@ public final class LucisRelighter {
         int width = bounds.widthBlocks();
         int depth = bounds.depthBlocks();
         int height = bounds.heightBlocks();
+        java.util.HashSet<Long> visited = new java.util.HashSet<>();
         for (BlockChangeRecord change : changes) {
+            if (!visited.add(BlockPos.asLong(change.x(), change.y(), change.z()))) {
+                continue;
+            }
             int localX = change.x() - minBlockX;
             int localY = change.y() - minBuildY;
             int localZ = change.z() - minBlockZ;
@@ -214,8 +183,13 @@ public final class LucisRelighter {
                 continue;
             }
             pos.set(change.x(), change.y(), change.z());
-            int oldMaterial = materialCache.lookupLight(level, change.oldState(), pos);
-            int newMaterial = materialCache.lookupLight(level, change.newState(), pos);
+            LightChunk chunk = getter.getChunkForLighting(change.x() >> 4, change.z() >> 4);
+            if (chunk == null) {
+                continue;
+            }
+            int index = data.localIndex(localX, localY, localZ);
+            int oldMaterial = data.materials[index] & 0xFFFF;
+            int newMaterial = materialCache.lookupLight(getter.getLevel(), chunk.getBlockState(pos), pos);
             if (LightMaterial.hasSameRuntimeProperties(oldMaterial, newMaterial)) {
                 continue;
             }
@@ -228,6 +202,7 @@ public final class LucisRelighter {
             long change = changes.get(i);
             int index = RuntimeLightChangeBuffer.localIndex(change);
             int newLight = RuntimeLightChangeBuffer.newLight(change);
+            data.materials[index] = (short) RuntimeLightChangeBuffer.newMaterial(change);
             data.opacity[index] = (byte) (newLight & 0xF);
             data.emission[index] = (byte) ((newLight >>> 4) & 0xF);
         }
@@ -259,6 +234,11 @@ public final class LucisRelighter {
             if (y > 0 && (data.blockLight[index + data.offsetNegY] & 0xF) != 0) return true;
         }
         return false;
+    }
+
+    public record PreparedRuntimeRegion(RuntimeRegionState state, LightChunk coreChunk,
+                                        java.util.Map<Long, LightChunk> sources,
+                                        RuntimeLightChangeBuffer changes, boolean full, long epoch) {
     }
 
     private void countPublished(String prefix, List<LucisRelightResult> results) {

@@ -22,8 +22,8 @@ public abstract class ServerLevelMixin {
         if (chunk == null || !chunk.getFullStatus().isOrAfter(FullChunkStatus.BLOCK_TICKING)) {
             return;
         }
-        if (!LightEngine.hasDifferentLightProperties(level, pos, oldState, newState)
-                && !LucisServices.controller().hasRelevantRuntimeMaterialChange(level, pos, oldState, newState)) {
+        if (LightEngine.hasDifferentLightProperties(level, pos, oldState, newState)
+                || !LucisServices.controller().hasRelevantRuntimeMaterialChange(level, pos, oldState, newState)) {
             return;
         }
         LucisServices.controller().enqueueBlockChange(level, pos, oldState, newState);

@@ -20,6 +20,7 @@ import net.minecraft.world.level.chunk.LightChunk;
 import net.minecraft.world.level.chunk.LightChunkGetter;
 
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -27,20 +28,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 public final class LucisEngineController {
     private static final int RUNTIME_REGION_CHUNKS = Math.max(1, Math.min(Integer.getInteger("lucis.runtimeRegionChunks", 1), 16));
-    private static final int RUNTIME_HALO_CHUNKS = 0;
+    private static final int RUNTIME_HALO_CHUNKS = 1;
 
     private final LightMaterialCache materialCache = new LightMaterialCache();
     private final LucisRelighter relighter = new LucisRelighter(materialCache, new LucisRegionExtractor(materialCache));
-    private final LucisRuntimeManager runtimeManager = new LucisRuntimeManager();
+    private final Map<Level, LucisRuntimeManager> runtimeManagers = new IdentityHashMap<>();
+    private final dev.denismasterherobrine.lucis.light.runtime.LucisScheduler runtimeScheduler = LucisRuntimeManager.createScheduler();
     private final ExecutorService worldgenWorkers = Executors.newFixedThreadPool(worldgenWorkerCount(), new LucisWorldgenThreadFactory());
     private final AtomicInteger pendingWorldgenTasks = new AtomicInteger();
     private final ThreadLocal<Integer> worldgenWriteDepth = ThreadLocal.withInitial(() -> 0);
     private final ThreadLocal<RuntimeBulkScope> runtimeBulkScope = new ThreadLocal<>();
-    private final AtomicLong runtimeBackpressureUntilNanos = new AtomicLong();
 
     public boolean enabled() {
         return LucisConfig.enabled;
@@ -97,17 +97,19 @@ public final class LucisEngineController {
                 && LucisConfig.enableRuntime
                 && pos != null
                 && !isWorldgenWriteSuppressed()
-                && !runtimeBackpressureActive()
-                && runtimeManager.canAcceptMoreWork();
+                && LucisConfig.enableSky
+                && LucisConfig.enableBlock;
     }
 
     public boolean shouldHandleBlockChange(LightChunkGetter getter, BlockPos pos) {
-        return shouldHandleBlockChange(pos) && !LucisCompat.isSablePlotChunk(getter,
+        return getter.getLevel() instanceof Level level && shouldHandleBlockChange(level, pos)
+                && !LucisCompat.isSablePlotChunk(getter,
                 SectionPos.blockToSectionCoord(pos.getX()), SectionPos.blockToSectionCoord(pos.getZ()));
     }
 
     public boolean shouldHandleBlockChange(Level level, BlockPos pos) {
-        return shouldHandleBlockChange(pos) && !LucisCompat.isSablePlotChunk(level,
+        return level != null && shouldHandleBlockChange(pos)
+                && !LucisCompat.isSablePlotChunk(level,
                 SectionPos.blockToSectionCoord(pos.getX()), SectionPos.blockToSectionCoord(pos.getZ()));
     }
 
@@ -120,15 +122,45 @@ public final class LucisEngineController {
         return !LightMaterial.hasSameRuntimeProperties(oldMaterial, newMaterial);
     }
 
-    public void enqueueBlockChange(BlockPos pos, BlockState oldState, BlockState newState) {
-        if (!shouldHandleBlockChange(pos)) {
-            return;
+    private synchronized LucisRuntimeManager runtimeManager(Level level) {
+        return runtimeManagers.computeIfAbsent(level, ignored -> new LucisRuntimeManager(runtimeScheduler));
+    }
+
+    public boolean enqueueLightCheck(LightChunkGetter getter, BlockPos pos) {
+        if (!(getter.getLevel() instanceof Level level)) {
+            return false;
         }
-        long startedAt = LucisBenchmarkSupport.start();
-        if (!runtimeManager.enqueue(pos.getX(), pos.getY(), pos.getZ(), oldState, newState)) {
-            activateRuntimeBackpressure();
+        if (!shouldHandleBlockChange(getter, pos) || !hasRuntimeNeighbors(getter, pos)) {
+            invalidateRuntime(level, pos);
+            return false;
         }
-        LucisBenchmarkSupport.recordSince("lucis.enqueue_block_change", startedAt);
+        LightChunk chunk = getter.getChunkForLighting(pos.getX() >> 4, pos.getZ() >> 4);
+        if (!(chunk instanceof net.minecraft.world.level.chunk.LevelChunk) || !((ChunkAccess) chunk).isLightCorrect()) {
+            invalidateRuntime(level, pos);
+            return false;
+        }
+        return enqueueBlockChange(level, pos, null, chunk.getBlockState(pos));
+    }
+
+    private boolean hasRuntimeNeighbors(LightChunkGetter getter, BlockPos pos) {
+        int chunkX = pos.getX() >> 4;
+        int chunkZ = pos.getZ() >> 4;
+        for (int z = chunkZ - 1; z <= chunkZ + 1; z++) {
+            for (int x = chunkX - 1; x <= chunkX + 1; x++) {
+                LightChunk chunk = getter.getChunkForLighting(x, z);
+                if (!(chunk instanceof ChunkAccess access) || !access.isLightCorrect()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private synchronized void invalidateRuntime(Level level, BlockPos pos) {
+        LucisRuntimeManager manager = runtimeManagers.get(level);
+        if (manager != null) {
+            manager.invalidate(pos.getX(), pos.getZ());
+        }
     }
 
     public boolean enqueueBlockChange(Level level, BlockPos pos, BlockState oldState, BlockState newState) {
@@ -141,14 +173,13 @@ public final class LucisEngineController {
         }
         if (bulkScope != null) {
             if (!bulkScope.boundsRegistered) {
-                bulkScope.record(pos);
+                bulkScope.record(level, pos);
                 LucisBenchmarkSupport.count("lucis.runtime.bulk.suppressed_block_change");
             }
             return true;
         }
         long startedAt = LucisBenchmarkSupport.start();
-        if (!runtimeManager.enqueue(pos.getX(), pos.getY(), pos.getZ(), oldState, newState)) {
-            activateRuntimeBackpressure();
+        if (!runtimeManager(level).enqueue(pos.getX(), pos.getY(), pos.getZ(), oldState, newState)) {
             LucisBenchmarkSupport.recordSince("lucis.enqueue_block_change", startedAt);
             return false;
         }
@@ -170,10 +201,10 @@ public final class LucisEngineController {
         if (scope == null || level == null || !enabled() || !LucisConfig.enableRuntime) {
             return;
         }
-        int minChunkX = Math.floorDiv(minX, 16);
-        int maxChunkX = Math.floorDiv(maxXExclusive - 1, 16);
-        int minChunkZ = Math.floorDiv(minZ, 16);
-        int maxChunkZ = Math.floorDiv(maxZExclusive - 1, 16);
+        int minChunkX = Math.floorDiv(minX, 16) - RUNTIME_HALO_CHUNKS;
+        int maxChunkX = Math.floorDiv(maxXExclusive - 1, 16) + RUNTIME_HALO_CHUNKS;
+        int minChunkZ = Math.floorDiv(minZ, 16) - RUNTIME_HALO_CHUNKS;
+        int maxChunkZ = Math.floorDiv(maxZExclusive - 1, 16) + RUNTIME_HALO_CHUNKS;
         long changesPerRegion = Math.max(1L, estimatedChanges / Math.max(1,
                 regionCount(minChunkX, maxChunkX, minChunkZ, maxChunkZ)));
         int minRegionChunkX = Math.floorDiv(minChunkX, RUNTIME_REGION_CHUNKS) * RUNTIME_REGION_CHUNKS;
@@ -183,7 +214,7 @@ public final class LucisEngineController {
         for (int regionChunkZ = minRegionChunkZ; regionChunkZ <= maxRegionChunkZ; regionChunkZ += RUNTIME_REGION_CHUNKS) {
             for (int regionChunkX = minRegionChunkX; regionChunkX <= maxRegionChunkX; regionChunkX += RUNTIME_REGION_CHUNKS) {
                 if (!LucisCompat.isSablePlotChunk(level, regionChunkX, regionChunkZ)) {
-                    scope.recordRegion(RegionBounds.regionKey(regionChunkX, regionChunkZ), changesPerRegion);
+                    scope.recordRegion(level, RegionBounds.regionKey(regionChunkX, regionChunkZ), changesPerRegion);
                 }
             }
         }
@@ -200,18 +231,19 @@ public final class LucisEngineController {
         }
         runtimeBulkScope.remove();
         boolean accepted = true;
-        for (Map.Entry<Long, Long> entry : scope.regionChangeCounts.entrySet()) {
-            if (!runtimeManager.enqueueFullRelight(entry.getKey(), entry.getValue())) {
-                accepted = false;
+        for (Map.Entry<Level, Map<Long, Long>> world : scope.regionChangeCounts.entrySet()) {
+            LucisRuntimeManager manager = runtimeManager(world.getKey());
+            for (Map.Entry<Long, Long> entry : world.getValue().entrySet()) {
+                if (!manager.enqueueFullRelight(entry.getKey(), entry.getValue())) {
+                    accepted = false;
+                }
             }
         }
-        LucisBenchmarkSupport.count("lucis.runtime.bulk.regions", scope.regionChangeCounts.size());
+        LucisBenchmarkSupport.count("lucis.runtime.bulk.regions",
+                scope.regionChangeCounts.values().stream().mapToInt(Map::size).sum());
         LucisBenchmarkSupport.count("lucis.runtime.bulk.estimated_changes", scope.originalChangeCount);
         if (scope.boundsRegistered) {
             LucisBenchmarkSupport.count("lucis.runtime.bulk.suppressed_block_change", scope.originalChangeCount);
-        }
-        if (!accepted) {
-            activateRuntimeBackpressure();
         }
         return accepted && !scope.regionChangeCounts.isEmpty();
     }
@@ -220,7 +252,7 @@ public final class LucisEngineController {
         if (!enabled() || !LucisConfig.enableRuntime) {
             return;
         }
-        runtimeManager.tick(lightEngine, getter, relighter, RUNTIME_REGION_CHUNKS, RUNTIME_HALO_CHUNKS,
+        runtimeManager((Level) getter.getLevel()).tick(lightEngine, getter, relighter, RUNTIME_REGION_CHUNKS, RUNTIME_HALO_CHUNKS,
                 LucisConfig.enableSky, LucisConfig.enableBlock);
     }
 
@@ -229,13 +261,15 @@ public final class LucisEngineController {
                 LucisConfig.regionChunks, LucisConfig.haloChunks);
     }
 
-    public void shutdown() {
-        runtimeManager.close();
+    public synchronized void shutdown() {
+        runtimeManagers.values().forEach(LucisRuntimeManager::close);
+        runtimeManagers.clear();
+        runtimeScheduler.close();
         worldgenWorkers.shutdownNow();
     }
 
-    public boolean hasPendingRuntimeWork() {
-        return runtimeManager.hasPendingWork();
+    public synchronized boolean hasPendingRuntimeWork() {
+        return runtimeManagers.values().stream().anyMatch(LucisRuntimeManager::hasPendingWork);
     }
 
     public boolean hasPendingWorldgenWork() {
@@ -271,38 +305,31 @@ public final class LucisEngineController {
         return (maxRegionX - minRegionX + 1) * (maxRegionZ - minRegionZ + 1);
     }
 
-    private static long regionKeyForBlock(BlockPos pos) {
-        int chunkX = SectionPos.blockToSectionCoord(pos.getX());
-        int chunkZ = SectionPos.blockToSectionCoord(pos.getZ());
-        int originChunkX = Math.floorDiv(chunkX, RUNTIME_REGION_CHUNKS) * RUNTIME_REGION_CHUNKS;
-        int originChunkZ = Math.floorDiv(chunkZ, RUNTIME_REGION_CHUNKS) * RUNTIME_REGION_CHUNKS;
-        return RegionBounds.regionKey(originChunkX, originChunkZ);
-    }
-
     private static final class RuntimeBulkScope {
-        private final HashMap<Long, Long> regionChangeCounts = new HashMap<>();
+        private final Map<Level, Map<Long, Long>> regionChangeCounts = new IdentityHashMap<>();
         private int depth = 1;
         private long originalChangeCount;
         private boolean boundsRegistered;
 
-        private void record(BlockPos pos) {
-            recordRegion(regionKeyForBlock(pos), 1);
+        private void record(Level level, BlockPos pos) {
+            int minChunkX = (pos.getX() >> 4) - RUNTIME_HALO_CHUNKS;
+            int maxChunkX = (pos.getX() >> 4) + RUNTIME_HALO_CHUNKS;
+            int minChunkZ = (pos.getZ() >> 4) - RUNTIME_HALO_CHUNKS;
+            int maxChunkZ = (pos.getZ() >> 4) + RUNTIME_HALO_CHUNKS;
+            for (int z = Math.floorDiv(minChunkZ, RUNTIME_REGION_CHUNKS) * RUNTIME_REGION_CHUNKS;
+                 z <= maxChunkZ; z += RUNTIME_REGION_CHUNKS) {
+                for (int x = Math.floorDiv(minChunkX, RUNTIME_REGION_CHUNKS) * RUNTIME_REGION_CHUNKS;
+                     x <= maxChunkX; x += RUNTIME_REGION_CHUNKS) {
+                    recordRegion(level, RegionBounds.regionKey(x, z), 1);
+                }
+            }
         }
 
-        private void recordRegion(long regionKey, long changes) {
+        private void recordRegion(Level level, long regionKey, long changes) {
             long count = Math.max(1L, changes);
-            regionChangeCounts.merge(regionKey, count, Long::sum);
+            regionChangeCounts.computeIfAbsent(level, ignored -> new HashMap<>()).merge(regionKey, count, Long::sum);
             originalChangeCount += count;
         }
-    }
-
-    private boolean runtimeBackpressureActive() {
-        return System.nanoTime() < runtimeBackpressureUntilNanos.get();
-    }
-
-    private void activateRuntimeBackpressure() {
-        LucisBenchmarkSupport.count("lucis.runtime.backpressure");
-        runtimeBackpressureUntilNanos.set(System.nanoTime() + 250_000_000L);
     }
 
     private boolean isSablePlotChunk(LightChunkGetter getter, ChunkPos chunkPos) {
