@@ -104,7 +104,11 @@ public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine imp
 
     @Inject(method = "checkBlock", at = @At("HEAD"), cancellable = true)
     private void lucis$checkBlock(BlockPos pos, org.spongepowered.asm.mixin.injection.callback.CallbackInfo ci) {
-        if (!LucisServices.controller().shouldHandleBlockChange(lucis$chunkSource, pos)) {
+        lucis$checkBlockStartedAt.remove();
+        if (!LucisServices.controller().enqueueLightCheck(lucis$chunkSource, pos)) {
+            if (LucisBenchmarkSupport.enabled()) {
+                lucis$checkBlockStartedAt.set(LucisBenchmarkSupport.start());
+            }
             return;
         }
 
@@ -113,27 +117,33 @@ public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine imp
         ci.cancel();
     }
 
-    @Inject(method = "checkBlock", at = @At("HEAD"))
-    private void lucis$startVanillaCheckBlock(BlockPos pos, CallbackInfo ci) {
-        if (!LucisServices.controller().shouldHandleBlockChange(lucis$chunkSource, pos) && LucisBenchmarkSupport.enabled()) {
-            lucis$checkBlockStartedAt.set(LucisBenchmarkSupport.start());
-        }
-    }
-
     @Inject(method = "checkBlock", at = @At("RETURN"))
     private void lucis$finishVanillaCheckBlock(BlockPos pos, CallbackInfo ci) {
-        if (!LucisServices.controller().shouldHandleBlockChange(lucis$chunkSource, pos)) {
-            Long startedAt = lucis$checkBlockStartedAt.get();
-            if (startedAt != null) {
-                LucisBenchmarkSupport.recordSince("engine.check_block", startedAt);
-            }
-            lucis$checkBlockStartedAt.remove();
+        Long startedAt = lucis$checkBlockStartedAt.get();
+        if (startedAt != null) {
+            LucisBenchmarkSupport.recordSince("engine.check_block", startedAt);
         }
+        lucis$checkBlockStartedAt.remove();
     }
 
     @Override
     public void lucis$publish(LucisRelightResult result, LightChunk expectedChunk) {
-        lucis$addPreTask(result.chunkPos().x, result.chunkPos().z, () -> lucis$publishDirect(result, expectedChunk));
+        lucis$publish(result, expectedChunk, () -> true);
+    }
+
+    @Override
+    public void lucis$publish(LucisRelightResult result, LightChunk expectedChunk, java.util.function.BooleanSupplier valid) {
+        this.lucis$taskMailbox.tell(() -> {
+            synchronized (this.lucis$publishLock) {
+                this.lucis$pendingLightTasks.addLast(new LucisQueuedLightTask(
+                        () -> {
+                            if (valid.getAsBoolean()) {
+                                lucis$publishDirect(result, expectedChunk);
+                            }
+                        }, null));
+            }
+            lucis$schedulePublishDrain();
+        });
     }
 
     @Unique

@@ -27,6 +27,10 @@ public final class OwnedRegionCache {
         return state;
     }
 
+    public RuntimeRegionState get(long regionKey) {
+        return cache.get(regionKey);
+    }
+
     public RuntimeRegionState getInitialized(long regionKey) {
         RuntimeRegionState state = cache.get(regionKey);
         if (state != null) {

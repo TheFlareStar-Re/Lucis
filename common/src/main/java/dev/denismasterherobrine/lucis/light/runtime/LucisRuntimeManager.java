@@ -33,15 +33,45 @@ public final class LucisRuntimeManager implements AutoCloseable {
     private final RuntimeUpdateQueue updateQueue = new RuntimeUpdateQueue(MAX_RUNTIME_PENDING_RECORDS, FULL_RELIGHT_CHANGE_THRESHOLD);
     private final RegionOwnerTable ownerTable = new RegionOwnerTable();
     private final OwnedRegionCache regionCache = new OwnedRegionCache();
-    private final LucisScheduler scheduler = new LucisScheduler(runtimeWorkerCount());
+    private final LucisScheduler scheduler;
+    private final boolean ownsScheduler;
+
     private final ConcurrentLinkedQueue<RuntimeCommit> commitQueue = new ConcurrentLinkedQueue<>();
     private final Set<Long> scheduledRegions = ConcurrentHashMap.newKeySet();
     private final AtomicLong ownerIds = new AtomicLong();
     private final HashMap<Long, RuntimeRegionBatch> drainedBatches = new HashMap<>();
     private final HashMap<Long, RuntimeRegionBatch> pendingBatchesByRegion = new HashMap<>();
     private final Object pendingBatchesLock = new Object();
+    private final HashMap<Long, RuntimeRegionBatch> waitingForNeighbors = new HashMap<>();
     private final ConcurrentHashMap<Long, Long> fullRelightCoalesceUntil = new ConcurrentHashMap<>();
     private volatile boolean closed;
+
+    public LucisRuntimeManager() {
+        this(new LucisScheduler(runtimeWorkerCount()), true);
+    }
+
+    public LucisRuntimeManager(LucisScheduler scheduler) {
+        this(scheduler, false);
+    }
+
+    private LucisRuntimeManager(LucisScheduler scheduler, boolean ownsScheduler) {
+        this.scheduler = scheduler;
+        this.ownsScheduler = ownsScheduler;
+    }
+
+    public static LucisScheduler createScheduler() {
+        return new LucisScheduler(runtimeWorkerCount());
+    }
+
+    public void invalidate(int x, int z) {
+        for (long key : affectedRegionKeys(x >> 4, z >> 4, RUNTIME_REGION_CHUNKS)) {
+            RuntimeRegionState state = regionCache.get(key);
+            if (state != null) {
+                state.invalidate();
+                updateQueue.enqueueFullRelight(key, 1);
+            }
+        }
+    }
 
     public boolean enqueue(BlockChangeRecord record) {
         return record != null && enqueue(record.x(), record.y(), record.z(), record.oldState(), record.newState());
@@ -51,7 +81,28 @@ public final class LucisRuntimeManager implements AutoCloseable {
         if (closed) {
             return false;
         }
-        long regionKey = regionKey(x >> 4, z >> 4, RUNTIME_REGION_CHUNKS);
+        boolean accepted = true;
+        for (long regionKey : affectedRegionKeys(x >> 4, z >> 4, RUNTIME_REGION_CHUNKS)) {
+            accepted &= enqueueRegion(regionKey, x, y, z, oldState, newState);
+        }
+        return accepted;
+    }
+
+    static List<Long> affectedRegionKeys(int chunkX, int chunkZ, int regionChunks) {
+        List<Long> keys = new ArrayList<>(9);
+        int minX = Math.floorDiv(chunkX - 1, regionChunks) * regionChunks;
+        int maxX = Math.floorDiv(chunkX + 1, regionChunks) * regionChunks;
+        int minZ = Math.floorDiv(chunkZ - 1, regionChunks) * regionChunks;
+        int maxZ = Math.floorDiv(chunkZ + 1, regionChunks) * regionChunks;
+        for (int z = minZ; z <= maxZ; z += regionChunks) {
+            for (int x = minX; x <= maxX; x += regionChunks) {
+                keys.add(RegionBounds.regionKey(x, z));
+            }
+        }
+        return keys;
+    }
+
+    private boolean enqueueRegion(long regionKey, int x, int y, int z, BlockState oldState, BlockState newState) {
         if (isFullRelightCoalescing(regionKey)) {
             updateQueue.enqueueFullRelight(regionKey, 1);
             markFullRelightCoalescing(regionKey);
@@ -61,7 +112,10 @@ public final class LucisRuntimeManager implements AutoCloseable {
         if (accepted && updateQueue.hasFullRelight(regionKey)) {
             markFullRelightCoalescing(regionKey);
         }
-        return accepted;
+        if (!accepted) {
+            updateQueue.enqueueFullRelight(regionKey, 1);
+        }
+        return true;
     }
 
     public boolean enqueueFullRelight(long regionKey, long originalChangeCount) {
@@ -84,18 +138,22 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
         scheduleQueuedRegions(getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
         flushCommits(lightEngine);
-        regionCache.trimToSize(LucisConfig.maxCachedRegions);
+        if (scheduledRegions.isEmpty()) {
+            regionCache.trimToSize(Math.max(1, LucisConfig.maxCachedRegions / 9));
+        }
     }
 
     public boolean hasPendingWork() {
         return !updateQueue.isEmpty()
                 || !commitQueue.isEmpty()
                 || !scheduledRegions.isEmpty()
+                || !pendingBatchesEmpty()
                 || scheduler.hasPendingWork();
     }
 
     private void scheduleQueuedRegions(LightChunkGetter getter, LucisRelighter relighter,
                                        int regionChunks, int haloChunks, boolean enableSky, boolean enableBlock) {
+        resumeLoadedRegions(getter, regionChunks, haloChunks);
         if (updateQueue.isEmpty() && pendingBatchesEmpty()) {
             return;
         }
@@ -135,6 +193,30 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
     }
 
+    private void resumeLoadedRegions(LightChunkGetter getter, int regionChunks, int haloChunks) {
+        Iterator<Map.Entry<Long, RuntimeRegionBatch>> iterator = waitingForNeighbors.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Long, RuntimeRegionBatch> entry = iterator.next();
+            long key = entry.getKey();
+            ChunkPos anchor = new ChunkPos(ChunkPos.getX(key), ChunkPos.getZ(key));
+            if (getter.getChunkForLighting(anchor.x, anchor.z) == null) {
+                iterator.remove();
+                continue;
+            }
+            RegionBounds bounds = RegionBounds.around(anchor, getter.getLevel(), regionChunks, haloChunks);
+            Map<Long, LightChunk> sources = captureSourceChunks(getter, bounds);
+            int sourceWidth = regionChunks + haloChunks * 2;
+            if (sources.size() == sourceWidth * sourceWidth
+                    && sources.values().stream().allMatch(chunk -> chunk instanceof net.minecraft.world.level.chunk.ChunkAccess access
+                    && access.isLightCorrect())) {
+                synchronized (pendingBatchesLock) {
+                    pendingBatchesByRegion.merge(key, entry.getValue(), LucisRuntimeManager::mergeBatches);
+                }
+                iterator.remove();
+            }
+        }
+    }
+
     private boolean pendingBatchesEmpty() {
         synchronized (pendingBatchesLock) {
             return pendingBatchesByRegion.isEmpty();
@@ -149,10 +231,16 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
 
         ChunkPos anchor = new ChunkPos(ChunkPos.getX(regionKey), ChunkPos.getZ(regionKey));
+        if (dev.denismasterherobrine.lucis.compat.LucisCompat.isSablePlotChunk(getter, anchor.x, anchor.z)) {
+            return;
+        }
         LightChunk coreChunk = getter.getChunkForLighting(anchor.x, anchor.z);
         if (coreChunk == null) {
             LucisBenchmarkSupport.count("lucis.runtime.requeued.missingChunk");
-            requeue(regionKey, batch);
+            RuntimeRegionState previous = regionCache.get(regionKey);
+            if (previous != null) {
+                previous.invalidate();
+            }
             return;
         }
         if (!scheduledRegions.add(regionKey)) {
@@ -176,12 +264,42 @@ public final class LucisRuntimeManager implements AutoCloseable {
         LucisBenchmarkSupport.count("lucis.runtime.jobs.runtime.submit");
         LucisBenchmarkSupport.count(batch.fullRelight() ? "lucis.runtime.jobs.fullRelight" : "lucis.runtime.jobs.incremental");
         LucisBenchmarkSupport.count("lucis.runtime.jobs.changeRecords", batch.queuedChangeCount());
+        HashMap<Long, LightChunk> sources = captureSourceChunks(getter, bounds);
+        int sourceWidth = regionChunks + haloChunks * 2;
+        if (sources.size() != sourceWidth * sourceWidth
+                || sources.values().stream().anyMatch(chunk -> !(chunk instanceof net.minecraft.world.level.chunk.ChunkAccess access)
+                || !access.isLightCorrect())) {
+            ownedState.invalidate();
+            // 缺少邻区块时交还原版，避免把缺失区块当空气发布。
+            for (BlockChangeRecord change : batch.changes()) {
+                lightCheckFallback(getter, change);
+            }
+            waitingForNeighbors.merge(regionKey, RuntimeRegionBatch.fullRelight(batch.originalChangeCount()),
+                    LucisRuntimeManager::mergeBatches);
+            ownerTable.release(regionKey, ownerId);
+            scheduledRegions.remove(regionKey);
+            return;
+        }
+        waitingForNeighbors.remove(regionKey);
+        LucisRelighter.PreparedRuntimeRegion prepared;
+        try {
+            prepared = relighter.prepareRuntimeRegion(getter, ownedState, coreChunk, batch, sources);
+        } catch (Throwable throwable) {
+            ownedState.invalidate();
+            ownerTable.release(regionKey, ownerId);
+            scheduledRegions.remove(regionKey);
+            requeue(regionKey, RuntimeRegionBatch.fullRelight(batch.originalChangeCount()));
+            throw throwable;
+        }
         boolean submitted = scheduler.submit(new LucisJob(() -> {
             long jobStartedAt = LucisBenchmarkSupport.start();
             try {
-                List<LucisRelightResult> results = relighter.relightRuntimeRegion(getter, ownedState, coreChunk,
-                        batch, enableSky, enableBlock);
+                List<LucisRelightResult> results = relighter.relightPreparedRuntimeRegion(prepared, enableSky, enableBlock);
                 if (closed) {
+                    return;
+                }
+                if (ownedState.epoch() != prepared.epoch()) {
+                    requeue(regionKey, RuntimeRegionBatch.fullRelight(batch.originalChangeCount()));
                     return;
                 }
                 LucisBenchmarkSupport.count("lucis.runtime.jobs.results", results.size());
@@ -192,8 +310,12 @@ public final class LucisRuntimeManager implements AutoCloseable {
                         LucisBenchmarkSupport.count("lucis.runtime.commit.skippedMissingExpectedChunk");
                         continue;
                     }
-                    commitQueue.add(new RuntimeCommit(result, expectedChunk));
+                    commitQueue.add(new RuntimeCommit(result, expectedChunk, ownedState, prepared.epoch()));
                 }
+            } catch (Throwable throwable) {
+                ownedState.invalidate();
+                requeue(regionKey, RuntimeRegionBatch.fullRelight(batch.originalChangeCount()));
+                throw throwable;
             } finally {
                 LucisBenchmarkSupport.recordSince("lucis.stage.runtime.job.runtime", jobStartedAt);
                 ownerTable.release(regionKey, ownerId);
@@ -208,6 +330,18 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
     }
 
+    private void lightCheckFallback(LightChunkGetter getter, BlockChangeRecord change) {
+        dev.denismasterherobrine.lucis.light.engine.LucisEngineController controller =
+                dev.denismasterherobrine.lucis.light.engine.LucisServices.controller();
+        controller.beginWorldgenWrite();
+        try {
+            ((net.minecraft.world.level.Level) getter.getLevel()).getLightEngine()
+                    .checkBlock(new net.minecraft.core.BlockPos(change.x(), change.y(), change.z()));
+        } finally {
+            controller.endWorldgenWrite();
+        }
+    }
+
     private void requeue(long regionKey, RuntimeRegionBatch batch) {
         if (batch == null || batch.isEmpty()) {
             return;
@@ -216,8 +350,23 @@ public final class LucisRuntimeManager implements AutoCloseable {
             updateQueue.enqueueFullRelight(regionKey, batch.originalChangeCount());
             markFullRelightCoalescing(regionKey);
         } else {
-            updateQueue.enqueueAll(regionKey, batch.changes());
+            if (updateQueue.enqueueAll(regionKey, batch.changes()) < batch.changes().size()) {
+                updateQueue.enqueueFullRelight(regionKey, batch.originalChangeCount());
+            }
         }
+    }
+
+    private HashMap<Long, LightChunk> captureSourceChunks(LightChunkGetter getter, RegionBounds bounds) {
+        HashMap<Long, LightChunk> chunks = new HashMap<>();
+        for (int z = bounds.minBlockZ() >> 4; z < bounds.maxBlockZExclusive() >> 4; z++) {
+            for (int x = bounds.minBlockX() >> 4; x < bounds.maxBlockXExclusive() >> 4; x++) {
+                LightChunk chunk = getter.getChunkForLighting(x, z);
+                if (chunk != null) {
+                    chunks.put(ChunkPos.asLong(x, z), chunk);
+                }
+            }
+        }
+        return chunks;
     }
 
     private HashMap<Long, LightChunk> captureExpectedChunks(LightChunkGetter getter, RegionBounds bounds) {
@@ -271,7 +420,9 @@ public final class LucisRuntimeManager implements AutoCloseable {
             any = true;
             LucisBenchmarkSupport.count("lucis.runtime.commit.results");
             LucisBenchmarkSupport.count("lucis.runtime.commit.sections", result.sections().size());
-            publisher.lucis$publish(result, commit.expectedChunk());
+            RuntimeCommit current = commit;
+            publisher.lucis$publish(result, current.expectedChunk(),
+                    () -> !closed && current.state().epoch() == current.epoch());
         }
         if (any) {
             lightEngine.tryScheduleUpdate();
@@ -304,7 +455,9 @@ public final class LucisRuntimeManager implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
-        scheduler.close();
+        if (ownsScheduler) {
+            scheduler.close();
+        }
         updateQueue.clear();
         commitQueue.clear();
         synchronized (pendingBatchesLock) {
@@ -319,6 +472,6 @@ public final class LucisRuntimeManager implements AutoCloseable {
     private record ScheduledRegionBatch(long regionKey, RuntimeRegionBatch batch) {
     }
 
-    private record RuntimeCommit(LucisRelightResult result, LightChunk expectedChunk) {
+    private record RuntimeCommit(LucisRelightResult result, LightChunk expectedChunk, RuntimeRegionState state, long epoch) {
     }
 }

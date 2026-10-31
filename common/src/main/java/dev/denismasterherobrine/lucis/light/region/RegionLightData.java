@@ -8,6 +8,7 @@ public final class RegionLightData {
     public final RegionBounds bounds;
     public final byte[] opacity;
     public final byte[] emission;
+    public final short[] materials;
     public final byte[] blockLight;
     public final byte[] skyLight;
     public final BitSet dirtyBlockSections;
@@ -27,6 +28,7 @@ public final class RegionLightData {
         this.bounds = bounds;
         this.opacity = new byte[bounds.volume()];
         this.emission = new byte[bounds.volume()];
+        this.materials = new short[bounds.volume()];
         this.blockLight = new byte[bounds.volume()];
         this.skyLight = new byte[bounds.volume()];
         int sectionCapacity = bounds.widthBlocks() / 16 * bounds.depthBlocks() / 16 * bounds.sectionCount();
@@ -171,6 +173,7 @@ public final class RegionLightData {
     public void resetForReuse() {
         java.util.Arrays.fill(opacity, (byte) 0);
         java.util.Arrays.fill(emission, (byte) 0);
+        java.util.Arrays.fill(materials, (short) 0);
         clearLight();
     }
 }
