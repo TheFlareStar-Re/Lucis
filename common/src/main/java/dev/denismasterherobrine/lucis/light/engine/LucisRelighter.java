@@ -92,12 +92,13 @@ public final class LucisRelighter {
         RegionLightData data = state.data();
         boolean full = batch.fullRelight() || !state.initializedForSources(sources);
         RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer(batch.queuedChangeCount());
+        RuntimeRegionSnapshot snapshot = null;
         if (full) {
-            extractor.populate(getter, data, coreChunk);
+            snapshot = RuntimeRegionSnapshot.capture(getter.getLevel(), data.bounds, sources, materialCache);
         } else {
             materializeChanges(getter, data, batch.changes(), changes);
         }
-        return new PreparedRuntimeRegion(state, coreChunk, sources, changes, full, state.epoch());
+        return new PreparedRuntimeRegion(state, coreChunk, sources, changes, full, state.epoch(), snapshot);
     }
 
     public List<LucisRelightResult> relightPreparedRuntimeRegion(PreparedRuntimeRegion prepared,
@@ -105,6 +106,7 @@ public final class LucisRelighter {
         RuntimeRegionState state = prepared.state();
         RegionLightData data = state.data();
         if (prepared.full()) {
+            prepared.snapshot().populate(data);
             if (enableSky) {
                 skyLightEngine.compute(data);
             }
@@ -238,7 +240,8 @@ public final class LucisRelighter {
 
     public record PreparedRuntimeRegion(RuntimeRegionState state, LightChunk coreChunk,
                                         java.util.Map<Long, LightChunk> sources,
-                                        RuntimeLightChangeBuffer changes, boolean full, long epoch) {
+                                        RuntimeLightChangeBuffer changes, boolean full, long epoch,
+                                        RuntimeRegionSnapshot snapshot) {
     }
 
     private void countPublished(String prefix, List<LucisRelightResult> results) {

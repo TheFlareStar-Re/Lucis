@@ -27,7 +27,8 @@ public final class LucisRuntimeManager implements AutoCloseable {
     private static final int MAX_RUNTIME_REGION_SUBMITS_PER_TICK = Integer.getInteger("lucis.runtime.maxSubmitsPerTick", 0);
     private static final int MAX_RUNTIME_PENDING_RECORDS = Integer.getInteger("lucis.runtime.maxPendingRecords", 131_072);
     private static final int FULL_RELIGHT_CHANGE_THRESHOLD = Integer.getInteger("lucis.runtime.fullRelightChangeThreshold", 2048);
-    private static final long FULL_RELIGHT_COALESCE_NANOS = Long.getLong("lucis.runtime.fullRelightCoalesceNanos", 5_000_000_000L);
+    private static final long PREPARE_BUDGET_NANOS = Math.max(1L, Long.getLong("lucis.runtime.prepareBudgetNanos", 2_000_000L));
+    private static final int MAX_IN_FLIGHT_REGIONS = Math.max(1, runtimeWorkerCount() * 2);
     private static final int RUNTIME_REGION_CHUNKS = Math.max(1, Math.min(Integer.getInteger("lucis.runtimeRegionChunks", 1), 16));
 
     private final RuntimeUpdateQueue updateQueue = new RuntimeUpdateQueue(MAX_RUNTIME_PENDING_RECORDS, FULL_RELIGHT_CHANGE_THRESHOLD);
@@ -40,10 +41,9 @@ public final class LucisRuntimeManager implements AutoCloseable {
     private final Set<Long> scheduledRegions = ConcurrentHashMap.newKeySet();
     private final AtomicLong ownerIds = new AtomicLong();
     private final HashMap<Long, RuntimeRegionBatch> drainedBatches = new HashMap<>();
-    private final HashMap<Long, RuntimeRegionBatch> pendingBatchesByRegion = new HashMap<>();
+    private final Map<Long, RuntimeRegionBatch> pendingBatchesByRegion = new java.util.LinkedHashMap<>();
     private final Object pendingBatchesLock = new Object();
     private final HashMap<Long, RuntimeRegionBatch> waitingForNeighbors = new HashMap<>();
-    private final ConcurrentHashMap<Long, Long> fullRelightCoalesceUntil = new ConcurrentHashMap<>();
     private volatile boolean closed;
 
     public LucisRuntimeManager() {
@@ -103,15 +103,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
     }
 
     private boolean enqueueRegion(long regionKey, int x, int y, int z, BlockState oldState, BlockState newState) {
-        if (isFullRelightCoalescing(regionKey)) {
-            updateQueue.enqueueFullRelight(regionKey, 1);
-            markFullRelightCoalescing(regionKey);
-            return true;
-        }
         boolean accepted = updateQueue.enqueue(regionKey, x, y, z, oldState, newState);
-        if (accepted && updateQueue.hasFullRelight(regionKey)) {
-            markFullRelightCoalescing(regionKey);
-        }
         if (!accepted) {
             updateQueue.enqueueFullRelight(regionKey, 1);
         }
@@ -123,7 +115,6 @@ public final class LucisRuntimeManager implements AutoCloseable {
             return false;
         }
         updateQueue.enqueueFullRelight(regionKey, Math.max(1, originalChangeCount));
-        markFullRelightCoalescing(regionKey);
         return true;
     }
 
@@ -188,7 +179,19 @@ public final class LucisRuntimeManager implements AutoCloseable {
             }
         }
 
-        for (ScheduledRegionBatch batch : selected) {
+        long startedAt = System.nanoTime();
+        for (int i = 0; i < selected.size(); i++) {
+            if (scheduledRegions.size() >= MAX_IN_FLIGHT_REGIONS
+                    || (i > 0 && System.nanoTime() - startedAt >= PREPARE_BUDGET_NANOS)) {
+                synchronized (pendingBatchesLock) {
+                    for (int remaining = i; remaining < selected.size(); remaining++) {
+                        ScheduledRegionBatch deferred = selected.get(remaining);
+                        pendingBatchesByRegion.merge(deferred.regionKey(), deferred.batch(), LucisRuntimeManager::mergeBatches);
+                    }
+                }
+                break;
+            }
+            ScheduledRegionBatch batch = selected.get(i);
             scheduleRegion(batch.regionKey(), batch.batch(), getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
         }
     }
@@ -348,7 +351,6 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
         if (batch.fullRelight()) {
             updateQueue.enqueueFullRelight(regionKey, batch.originalChangeCount());
-            markFullRelightCoalescing(regionKey);
         } else {
             if (updateQueue.enqueueAll(regionKey, batch.changes()) < batch.changes().size()) {
                 updateQueue.enqueueFullRelight(regionKey, batch.originalChangeCount());
@@ -383,22 +385,6 @@ public final class LucisRuntimeManager implements AutoCloseable {
             }
         }
         return expectedChunks;
-    }
-
-    private boolean isFullRelightCoalescing(long regionKey) {
-        Long until = fullRelightCoalesceUntil.get(regionKey);
-        if (until == null) {
-            return false;
-        }
-        if (System.nanoTime() <= until) {
-            return true;
-        }
-        fullRelightCoalesceUntil.remove(regionKey, until);
-        return false;
-    }
-
-    private void markFullRelightCoalescing(long regionKey) {
-        fullRelightCoalesceUntil.put(regionKey, System.nanoTime() + FULL_RELIGHT_COALESCE_NANOS);
     }
 
     private static RuntimeRegionBatch mergeBatches(RuntimeRegionBatch existing, RuntimeRegionBatch incoming) {
@@ -466,7 +452,6 @@ public final class LucisRuntimeManager implements AutoCloseable {
         scheduledRegions.clear();
         ownerTable.clear();
         regionCache.clear();
-        fullRelightCoalesceUntil.clear();
     }
 
     private record ScheduledRegionBatch(long regionKey, RuntimeRegionBatch batch) {
