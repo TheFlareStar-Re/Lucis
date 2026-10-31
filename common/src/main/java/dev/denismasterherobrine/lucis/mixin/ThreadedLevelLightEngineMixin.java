@@ -162,6 +162,10 @@ public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine imp
             }
         }
         long startedAt = LucisBenchmarkSupport.start();
+        if (!result.sections().isEmpty() && !super.lightOnInSection(SectionPos.of(result.chunkPos(), 0))) {
+            // 接管 lightChunk 后仍须启用原版光源，否则天空光缓冲段和回退更新会变黑。
+            super.setLightEnabled(result.chunkPos(), true);
+        }
         for (LucisSectionData section : result.sections()) {
             super.queueSectionData(section.layer(), section.sectionPos(), section.dataLayer());
             super.updateSectionStatus(section.sectionPos(), false);

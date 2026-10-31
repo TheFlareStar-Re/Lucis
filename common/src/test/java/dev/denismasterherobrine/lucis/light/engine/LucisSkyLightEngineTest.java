@@ -188,6 +188,31 @@ class LucisSkyLightEngineTest {
         assertEquals(0, sky(data, 52, deepY, 52));
     }
 
+    @Test
+    void removingRoofRestoresDirectSkyAcrossClearedGround() {
+        RegionLightData data = newRegionData();
+        applyRoofOpacity(data, 15);
+        LucisSkyLightEngine engine = new LucisSkyLightEngine();
+        engine.compute(data);
+        assertEquals(0, sky(data, CENTER, DEEP_Y, CENTER));
+        RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer(1024);
+        for (int z = ROOF_MIN; z <= ROOF_MAX; z++) {
+            for (int x = ROOF_MIN; x <= ROOF_MAX; x++) {
+                int index = data.localIndex(x, ROOF_Y, z);
+                data.opacity[index] = 0;
+                changes.addLight(index, LightMaterial.packLight(15, 0), LightMaterial.packLight(0, 0));
+            }
+        }
+        engine.applyRuntimeChanges(data, changes);
+        for (int z = ROOF_MIN; z <= ROOF_MAX; z++) {
+            for (int x = ROOF_MIN; x <= ROOF_MAX; x++) {
+                for (int y = 0; y < HEIGHT; y++) {
+                    assertEquals(15, sky(data, x, y, z), x + "," + y + "," + z);
+                }
+            }
+        }
+    }
+
     private static RegionLightData newRegionData() {
         RegionBounds bounds = new RegionBounds(0, 0, 3, 0, WIDTH, WIDTH,
                 0, HEIGHT, 0, HEIGHT / 16, HEIGHT, WIDTH * WIDTH, WIDTH * WIDTH * HEIGHT);
