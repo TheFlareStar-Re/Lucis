@@ -84,10 +84,13 @@ public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine imp
 
         long startedAt = LucisBenchmarkSupport.start();
         ChunkPos chunkPos = chunk.getPos();
+        CompletableFuture<LucisRelightResult> computed = LucisServices.controller()
+                .relightChunkAsync(lucis$chunkSource, chunk, trustEdges);
+        if (computed == null) {
+            return;
+        }
         chunk.setLightCorrect(false);
-        CompletableFuture<ChunkAccess> future = LucisServices.controller()
-                .relightChunkAsync(lucis$chunkSource, chunk, trustEdges)
-                .thenCompose(result -> {
+        CompletableFuture<ChunkAccess> future = computed.thenCompose(result -> {
                     LucisBenchmarkSupport.recordSince("lucis.light_chunk.compute", startedAt);
                     long publishStartedAt = LucisBenchmarkSupport.start();
                     CompletableFuture<Void> published = lucis$publishAsync(result, chunkPos.x, chunkPos.z);
@@ -134,6 +137,13 @@ public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine imp
 
     @Override
     public void lucis$publish(LucisRelightResult result, LightChunk expectedChunk, java.util.function.BooleanSupplier valid) {
+        lucis$publishTracked(result, expectedChunk, valid);
+    }
+
+    @Override
+    public CompletableFuture<Void> lucis$publishTracked(LucisRelightResult result, LightChunk expectedChunk,
+                                                       java.util.function.BooleanSupplier valid) {
+        CompletableFuture<Void> completion = new CompletableFuture<>();
         this.lucis$taskMailbox.tell(() -> {
             synchronized (this.lucis$publishLock) {
                 this.lucis$pendingLightTasks.addLast(new LucisQueuedLightTask(
@@ -141,10 +151,11 @@ public abstract class ThreadedLevelLightEngineMixin extends LevelLightEngine imp
                             if (valid.getAsBoolean()) {
                                 lucis$publishDirect(result, expectedChunk);
                             }
-                        }, null));
+                        }, completion));
             }
             lucis$schedulePublishDrain();
         });
+        return completion;
     }
 
     @Unique

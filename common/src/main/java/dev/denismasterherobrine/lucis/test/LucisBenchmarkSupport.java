@@ -16,6 +16,19 @@ public final class LucisBenchmarkSupport {
     private static final ConcurrentHashMap<String, LongAdder> COUNTS = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, LongAdder> COUNTERS = new ConcurrentHashMap<>();
     private static final AtomicLong RESET_EPOCH = new AtomicLong();
+    private static final ConcurrentHashMap<String, AtomicLong> GAUGES = new ConcurrentHashMap<>();
+
+    public static void gauge(String key, long value) {
+        if (enabled()) {
+            GAUGES.computeIfAbsent(key, ignored -> new AtomicLong()).set(value);
+        }
+    }
+
+    public static void highWater(String key, long value) {
+        if (enabled()) {
+            GAUGES.computeIfAbsent(key, ignored -> new AtomicLong()).accumulateAndGet(value, Math::max);
+        }
+    }
 
     private LucisBenchmarkSupport() {
     }
@@ -39,6 +52,7 @@ public final class LucisBenchmarkSupport {
         TIME_NANOS.clear();
         COUNTS.clear();
         COUNTERS.clear();
+        GAUGES.clear();
         RESET_EPOCH.incrementAndGet();
     }
 
@@ -54,6 +68,7 @@ public final class LucisBenchmarkSupport {
         TIME_NANOS.forEach((key, nanos) -> metrics.put(key, new Metric(nanos.sum(), counterValue(COUNTS, key))));
         Map<String, Long> counters = new TreeMap<>();
         COUNTERS.forEach((key, counter) -> counters.put(key, counter.sum()));
+        GAUGES.forEach((key, value) -> counters.put(key, value.get()));
         return new Snapshot(metrics, counters);
     }
 
@@ -124,6 +139,10 @@ public final class LucisBenchmarkSupport {
                         name,
                         entry.getKey(),
                         entry.getValue().sum()));
+        GAUGES.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> Lucis.LOGGER.info("LUCIS_BENCH_GAUGE mode={} name={} gauge={} value={}",
+                        activeMode(), name, entry.getKey(), entry.getValue().get()));
     }
 
     private static long counterValue(Map<String, LongAdder> counters, String key) {
