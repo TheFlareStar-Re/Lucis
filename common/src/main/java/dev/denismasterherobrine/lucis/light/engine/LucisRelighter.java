@@ -93,6 +93,9 @@ public final class LucisRelighter {
         boolean full = batch.fullRelight() || !state.initializedForSources(sources);
         RuntimeLightChangeBuffer changes = new RuntimeLightChangeBuffer(batch.queuedChangeCount());
         RuntimeRegionSnapshot snapshot = null;
+        LucisBenchmarkSupport.count(full
+                ? (batch.fullRelight() ? "lucis.runtime.full.requested" : "lucis.runtime.full.uninitializedSources")
+                : "lucis.runtime.prepare.incremental");
         if (full) {
             snapshot = RuntimeRegionSnapshot.capture(getter.getLevel(), data.bounds, sources, materialCache);
         } else {

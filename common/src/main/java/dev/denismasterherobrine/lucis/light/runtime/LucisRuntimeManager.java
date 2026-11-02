@@ -29,6 +29,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
     private static final int FULL_RELIGHT_CHANGE_THRESHOLD = Integer.getInteger("lucis.runtime.fullRelightChangeThreshold", 2048);
     private static final long PREPARE_BUDGET_NANOS = Math.max(1L, Long.getLong("lucis.runtime.prepareBudgetNanos", 2_000_000L));
     private static final int MAX_IN_FLIGHT_REGIONS = Math.max(1, runtimeWorkerCount() * 2);
+    private static final long CACHE_ARRAY_BUDGET = Math.max(1L, Long.getLong("lucis.runtime.cacheBytes", 128L * 1024 * 1024));
     private static final int RUNTIME_REGION_CHUNKS = Math.max(1, Math.min(Integer.getInteger("lucis.runtimeRegionChunks", 1), 16));
 
     private final RuntimeUpdateQueue updateQueue = new RuntimeUpdateQueue(MAX_RUNTIME_PENDING_RECORDS, FULL_RELIGHT_CHANGE_THRESHOLD);
@@ -129,9 +130,9 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
         scheduleQueuedRegions(getter, relighter, regionChunks, haloChunks, enableSky, enableBlock);
         flushCommits(lightEngine);
-        if (scheduledRegions.isEmpty()) {
-            regionCache.trimToSize(Math.max(1, LucisConfig.maxCachedRegions / 9));
-        }
+        regionCache.trimToBudget(LucisConfig.maxCachedRegions, CACHE_ARRAY_BUDGET);
+        LucisBenchmarkSupport.gauge("lucis.runtime.lastWorldInFlight", scheduledRegions.size());
+        LucisBenchmarkSupport.gauge("lucis.runtime.lastWorldPendingRegions", pendingBatchesByRegion.size());
     }
 
     public boolean hasPendingWork() {
@@ -169,7 +170,8 @@ public final class LucisRuntimeManager implements AutoCloseable {
                     LucisBenchmarkSupport.count("lucis.runtime.requeued.batchLimit");
                     break;
                 }
-                if (scheduledRegions.contains(entry.getKey())) {
+                RuntimeRegionState cached = regionCache.get(entry.getKey());
+                if (scheduledRegions.contains(entry.getKey()) || (cached != null && cached.inUse())) {
                     continue;
                 }
                 RuntimeRegionBatch batch = entry.getValue();
@@ -262,17 +264,16 @@ public final class LucisRuntimeManager implements AutoCloseable {
 
         RegionBounds bounds = RegionBounds.around(anchor, getter.getLevel(), regionChunks, haloChunks);
         HashMap<Long, LightChunk> expectedChunks = captureExpectedChunks(getter, bounds);
-        RuntimeRegionState ownedState = regionCache.getOrCreate(bounds);
-        ownedState.touch();
-        LucisBenchmarkSupport.count("lucis.runtime.jobs.runtime.submit");
-        LucisBenchmarkSupport.count(batch.fullRelight() ? "lucis.runtime.jobs.fullRelight" : "lucis.runtime.jobs.incremental");
-        LucisBenchmarkSupport.count("lucis.runtime.jobs.changeRecords", batch.queuedChangeCount());
         HashMap<Long, LightChunk> sources = captureSourceChunks(getter, bounds);
         int sourceWidth = regionChunks + haloChunks * 2;
         if (sources.size() != sourceWidth * sourceWidth
                 || sources.values().stream().anyMatch(chunk -> !(chunk instanceof net.minecraft.world.level.chunk.ChunkAccess access)
                 || !access.isLightCorrect())) {
-            ownedState.invalidate();
+            RuntimeRegionState previous = regionCache.get(regionKey);
+            if (previous != null) {
+                previous.invalidate();
+            }
+            LucisBenchmarkSupport.count("lucis.runtime.cache.skippedMissingSources");
             // 缺少邻区块时交还原版，避免把缺失区块当空气发布。
             for (BlockChangeRecord change : batch.changes()) {
                 lightCheckFallback(getter, change);
@@ -284,11 +285,22 @@ public final class LucisRuntimeManager implements AutoCloseable {
             return;
         }
         waitingForNeighbors.remove(regionKey);
+        RuntimeRegionState ownedState = regionCache.getOrCreate(bounds, LucisConfig.maxCachedRegions, CACHE_ARRAY_BUDGET);
+        if (ownedState == null) {
+            ownerTable.release(regionKey, ownerId);
+            scheduledRegions.remove(regionKey);
+            requeue(regionKey, batch);
+            return;
+        }
+        ownedState.retain();
+        LucisBenchmarkSupport.count("lucis.runtime.jobs.runtime.submit");
+        LucisBenchmarkSupport.count("lucis.runtime.jobs.changeRecords", batch.queuedChangeCount());
         LucisRelighter.PreparedRuntimeRegion prepared;
         try {
             prepared = relighter.prepareRuntimeRegion(getter, ownedState, coreChunk, batch, sources);
         } catch (Throwable throwable) {
             ownedState.invalidate();
+            ownedState.release();
             ownerTable.release(regionKey, ownerId);
             scheduledRegions.remove(regionKey);
             requeue(regionKey, RuntimeRegionBatch.fullRelight(batch.originalChangeCount()));
@@ -313,7 +325,12 @@ public final class LucisRuntimeManager implements AutoCloseable {
                         LucisBenchmarkSupport.count("lucis.runtime.commit.skippedMissingExpectedChunk");
                         continue;
                     }
-                    commitQueue.add(new RuntimeCommit(result, expectedChunk, ownedState, prepared.epoch()));
+                    synchronized (commitQueue) {
+                        if (!closed) {
+                            ownedState.retain();
+                            commitQueue.add(new RuntimeCommit(result, expectedChunk, ownedState, prepared.epoch()));
+                        }
+                    }
                 }
             } catch (Throwable throwable) {
                 ownedState.invalidate();
@@ -321,12 +338,14 @@ public final class LucisRuntimeManager implements AutoCloseable {
                 throw throwable;
             } finally {
                 LucisBenchmarkSupport.recordSince("lucis.stage.runtime.job.runtime", jobStartedAt);
+                ownedState.release();
                 ownerTable.release(regionKey, ownerId);
                 scheduledRegions.remove(regionKey);
             }
         }));
         if (!submitted) {
             LucisBenchmarkSupport.count("lucis.runtime.requeued.submitClosed");
+            ownedState.release();
             ownerTable.release(regionKey, ownerId);
             scheduledRegions.remove(regionKey);
             requeue(regionKey, batch);
@@ -407,8 +426,22 @@ public final class LucisRuntimeManager implements AutoCloseable {
             LucisBenchmarkSupport.count("lucis.runtime.commit.results");
             LucisBenchmarkSupport.count("lucis.runtime.commit.sections", result.sections().size());
             RuntimeCommit current = commit;
-            publisher.lucis$publish(result, current.expectedChunk(),
-                    () -> !closed && current.state().epoch() == current.epoch());
+            try {
+                publisher.lucis$publishTracked(result, current.expectedChunk(),
+                        () -> !closed && current.state().epoch() == current.epoch())
+                        .whenComplete((ignored, failure) -> {
+                            if (failure != null && !closed) {
+                                current.state().invalidate();
+                                updateQueue.enqueueFullRelight(current.state().data().bounds.coreRegionKey(), 1);
+                            }
+                            current.state().release();
+                        });
+            } catch (Throwable failure) {
+                current.state().invalidate();
+                current.state().release();
+                updateQueue.enqueueFullRelight(current.state().data().bounds.coreRegionKey(), 1);
+                throw failure;
+            }
         }
         if (any) {
             lightEngine.tryScheduleUpdate();
@@ -445,7 +478,14 @@ public final class LucisRuntimeManager implements AutoCloseable {
             scheduler.close();
         }
         updateQueue.clear();
-        commitQueue.clear();
+        synchronized (commitQueue) {
+            RuntimeCommit commit;
+            while ((commit = commitQueue.poll()) != null) {
+                commit.state().release();
+            }
+        }
+        waitingForNeighbors.clear();
+        drainedBatches.clear();
         synchronized (pendingBatchesLock) {
             pendingBatchesByRegion.clear();
         }

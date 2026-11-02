@@ -23,6 +23,7 @@ final class RuntimeSectionSnapshot<T> {
     static <T> RuntimeSectionSnapshot<T> capture(PalettedContainer<T> liveStates,
                                                 ToIntFunction<T> staticMaterial,
                                                 DynamicMaterial<T> dynamicMaterial) {
+        dev.denismasterherobrine.lucis.test.LucisBenchmarkSupport.count("lucis.runtime.snapshot.sections");
         PalettedContainer<T> states = liveStates.copy();
         IdentityHashMap<T, Integer> materials = new IdentityHashMap<>();
         Consumer<T> collect = state -> materials.put(state, staticMaterial.applyAsInt(state));
@@ -42,6 +43,7 @@ final class RuntimeSectionSnapshot<T> {
         short[] dynamic = null;
         if (materials.containsValue(-1)) {
             dynamic = new short[4096];
+            dev.denismasterherobrine.lucis.test.LucisBenchmarkSupport.count("lucis.runtime.snapshot.dynamicBytes", 8192);
             for (int index = 0; index < 4096; index++) {
                 T state = states.get(index & 15, index >> 8, (index >> 4) & 15);
                 if (materials.get(state) == -1) {

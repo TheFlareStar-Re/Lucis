@@ -9,6 +9,21 @@ public final class RuntimeRegionState {
     private Map<Long, ?> sources = Map.of();
     private long epoch;
     private volatile long lastAccessNanos;
+    private final java.util.concurrent.atomic.AtomicInteger references = new java.util.concurrent.atomic.AtomicInteger();
+
+    public void retain() {
+        references.incrementAndGet();
+    }
+
+    public void release() {
+        if (references.decrementAndGet() < 0) {
+            throw new IllegalStateException("Unbalanced runtime region release");
+        }
+    }
+
+    public boolean inUse() {
+        return references.get() != 0;
+    }
 
     public RuntimeRegionState(RegionLightData data) {
         this.data = data;
@@ -61,6 +76,7 @@ public final class RuntimeRegionState {
         epoch++;
         initialized = false;
         sources = Map.of();
+        sourceIdentity = null;
     }
 
     public void touch() {
