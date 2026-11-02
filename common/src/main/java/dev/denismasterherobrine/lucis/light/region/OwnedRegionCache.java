@@ -33,16 +33,28 @@ public final class OwnedRegionCache {
         long required = arrayBytes(bounds);
         // 一个超大区域允许单独进入，但不会与其他区域叠加突破预算。
         long budget = Math.max(maxBytes, required);
+        RegionLightData reusable = null;
         while (cache.size() >= Math.max(1, maxEntries) || arrayBytes > budget - required) {
-            if (!removeOldestIdleEntry()) {
+            RuntimeRegionState evicted = removeOldestIdleEntry();
+            if (evicted == null) {
                 LucisBenchmarkSupport.count("lucis.runtime.cache.admissionDeferred");
+                recordSize();
                 return null;
             }
+            // 只转交本次准入淘汰的数组，不另设缓存外的常驻池。
+            if (reusable == null && sameShape(evicted.data().bounds, bounds)) {
+                reusable = evicted.data();
+            }
         }
-        RuntimeRegionState state = new RuntimeRegionState(new RegionLightData(bounds));
+        RuntimeRegionState state = new RuntimeRegionState(new RegionLightData(bounds, reusable));
         cache.put(bounds.coreRegionKey(), state);
         arrayBytes += required;
-        LucisBenchmarkSupport.count("lucis.runtime.cache.allocatedBytes", required);
+        if (reusable == null) {
+            LucisBenchmarkSupport.count("lucis.runtime.cache.allocatedBytes", required);
+        } else {
+            LucisBenchmarkSupport.count("lucis.runtime.cache.reused");
+            LucisBenchmarkSupport.count("lucis.runtime.cache.reusedBytes", required);
+        }
         recordSize();
         return state;
     }
@@ -65,14 +77,14 @@ public final class OwnedRegionCache {
 
     public void trimToBudget(int maxEntries, long maxBytes) {
         while (cache.size() > Math.max(1, maxEntries) || (cache.size() > 1 && arrayBytes > maxBytes)) {
-            if (!removeOldestIdleEntry()) {
+            if (removeOldestIdleEntry() == null) {
                 break;
             }
         }
         recordSize();
     }
 
-    private boolean removeOldestIdleEntry() {
+    private RuntimeRegionState removeOldestIdleEntry() {
         long oldestKey = 0L;
         long oldestAccess = Long.MAX_VALUE;
         RuntimeRegionState oldest = null;
@@ -85,11 +97,11 @@ public final class OwnedRegionCache {
             }
         }
         if (oldest == null) {
-            return false;
+            return null;
         }
         remove(oldestKey, oldest);
         LucisBenchmarkSupport.count("lucis.runtime.cache.evicted");
-        return true;
+        return oldest;
     }
 
     private void remove(long key, RuntimeRegionState state) {

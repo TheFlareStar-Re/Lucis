@@ -25,12 +25,20 @@ public final class RegionLightData {
     public final int offsetNegY;
 
     public RegionLightData(RegionBounds bounds) {
+        this(bounds, null);
+    }
+
+    // 仅接收已淘汰且所有任务引用均已释放的数组；坐标和脏标记重新建立。
+    RegionLightData(RegionBounds bounds, RegionLightData reusable) {
+        if (reusable != null && reusable.bounds.volume() != bounds.volume()) {
+            throw new IllegalArgumentException("Incompatible region array capacity");
+        }
         this.bounds = bounds;
-        this.opacity = new byte[bounds.volume()];
-        this.emission = new byte[bounds.volume()];
-        this.materials = new short[bounds.volume()];
-        this.blockLight = new byte[bounds.volume()];
-        this.skyLight = new byte[bounds.volume()];
+        this.opacity = reusable == null ? new byte[bounds.volume()] : reusable.opacity;
+        this.emission = reusable == null ? new byte[bounds.volume()] : reusable.emission;
+        this.materials = reusable == null ? new short[bounds.volume()] : reusable.materials;
+        this.blockLight = reusable == null ? new byte[bounds.volume()] : reusable.blockLight;
+        this.skyLight = reusable == null ? new byte[bounds.volume()] : reusable.skyLight;
         int sectionCapacity = bounds.widthBlocks() / 16 * bounds.depthBlocks() / 16 * bounds.sectionCount();
         this.dirtyBlockSections = new BitSet(sectionCapacity);
         this.dirtySkySections = new BitSet(sectionCapacity);
@@ -44,6 +52,9 @@ public final class RegionLightData {
         this.offsetNegZ = -bounds.widthBlocks();
         this.offsetPosY = bounds.area();
         this.offsetNegY = -bounds.area();
+        if (reusable != null) {
+            resetForReuse();
+        }
     }
 
     public int index(int worldX, int worldY, int worldZ) {
