@@ -1,6 +1,10 @@
 package dev.denismasterherobrine.lucis.neoforge;
 
 import dev.denismasterherobrine.lucis.Lucis;
+import dev.denismasterherobrine.lucis.light.engine.LucisServices;
+import net.minecraft.server.level.ServerLevel;
+import net.neoforged.neoforge.event.level.ChunkEvent;
+import net.neoforged.neoforge.event.level.LevelEvent;
 import dev.denismasterherobrine.lucis.platform.LucisPlatform;
 import dev.denismasterherobrine.lucis.test.LucisClientLoadDiagnostics;
 import dev.denismasterherobrine.lucis.test.LucisServerBenchmark;
@@ -29,6 +33,21 @@ public final class LucisNeoForge {
         NeoForge.EVENT_BUS.addListener(this::onPlayerLoggedIn);
         NeoForge.EVENT_BUS.addListener(this::onServerStopping);
         NeoForge.EVENT_BUS.addListener(this::onServerStopped);
+        NeoForge.EVENT_BUS.addListener(this::onChunkUnload);
+        NeoForge.EVENT_BUS.addListener(this::onLevelUnload);
+    }
+
+    private void onChunkUnload(ChunkEvent.Unload event) {
+        if (event.getLevel() instanceof ServerLevel level) {
+            var pos = event.getChunk().getPos();
+            LucisServices.onChunkUnloaded(level, pos.x, pos.z);
+        }
+    }
+
+    private void onLevelUnload(LevelEvent.Unload event) {
+        if (event.getLevel() instanceof ServerLevel level) {
+            LucisServices.onLevelUnloaded(level);
+        }
     }
 
     private void onServerAboutToStart(ServerAboutToStartEvent event) {

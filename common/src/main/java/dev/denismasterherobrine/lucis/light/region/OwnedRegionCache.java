@@ -16,7 +16,7 @@ public final class OwnedRegionCache {
     // 创建和淘汰只在服务器线程执行；后台线程仅释放引用。
     public RuntimeRegionState getOrCreate(RegionBounds bounds, int maxEntries, long maxBytes) {
         RuntimeRegionState existing = cache.get(bounds.coreRegionKey());
-        if (existing != null && sameShape(existing.data().bounds, bounds)) {
+        if (existing != null && !existing.unloaded() && sameShape(existing.data().bounds, bounds)) {
             LucisBenchmarkSupport.count("lucis.runtime.cache.hit");
             existing.touch();
             return existing;
@@ -71,11 +71,32 @@ public final class OwnedRegionCache {
         return state != null && state.initialized() ? state : null;
     }
 
+    public void onChunkUnloaded(int chunkX, int chunkZ) {
+        for (Map.Entry<Long, RuntimeRegionState> entry : cache.entrySet()) {
+            RuntimeRegionState state = entry.getValue();
+            RegionBounds bounds = state.data().bounds;
+            if (chunkX >= (bounds.minBlockX() >> 4) && chunkX < (bounds.maxBlockXExclusive() >> 4)
+                    && chunkZ >= (bounds.minBlockZ() >> 4) && chunkZ < (bounds.maxBlockZExclusive() >> 4)) {
+                // 包括 halo 来源；在途任务保留数组所有权，但不能再提交旧结果。
+                state.unload();
+                if (!state.inUse()) {
+                    remove(entry.getKey(), state);
+                }
+            }
+        }
+        recordSize();
+    }
+
     public void trimToSize(int maxEntries) {
         trimToBudget(maxEntries, Long.MAX_VALUE);
     }
 
     public void trimToBudget(int maxEntries, long maxBytes) {
+        for (Map.Entry<Long, RuntimeRegionState> entry : cache.entrySet()) {
+            if (entry.getValue().unloaded() && !entry.getValue().inUse()) {
+                remove(entry.getKey(), entry.getValue());
+            }
+        }
         while (cache.size() > Math.max(1, maxEntries) || (cache.size() > 1 && arrayBytes > maxBytes)) {
             if (removeOldestIdleEntry() == null) {
                 break;

@@ -1,12 +1,16 @@
 package dev.denismasterherobrine.lucis.light.region;
 
+import java.lang.ref.WeakReference;
+import java.util.HashMap;
 import java.util.Map;
 
 public final class RuntimeRegionState {
     private final RegionLightData data;
     private volatile boolean initialized;
-    private volatile Object sourceIdentity;
-    private Map<Long, ?> sources = Map.of();
+    private volatile boolean unloaded;
+    // 缓存只校验来源身份，不能延长已卸载区块的生命周期。
+    private volatile WeakReference<Object> sourceIdentity;
+    private Map<Long, WeakReference<Object>> sources = Map.of();
     private long epoch;
     private volatile long lastAccessNanos;
     private final java.util.concurrent.atomic.AtomicInteger references = new java.util.concurrent.atomic.AtomicInteger();
@@ -39,11 +43,12 @@ public final class RuntimeRegionState {
     }
 
     public boolean initializedFor(Object sourceIdentity) {
-        return initialized && this.sourceIdentity == sourceIdentity;
+        WeakReference<Object> identity = this.sourceIdentity;
+        return initialized && sourceIdentity != null && identity != null && identity.refersTo(sourceIdentity);
     }
 
-    public void markInitialized(Object sourceIdentity) {
-        this.sourceIdentity = sourceIdentity;
+    public synchronized void markInitialized(Object sourceIdentity) {
+        this.sourceIdentity = new WeakReference<>(sourceIdentity);
         initialized = true;
         touch();
     }
@@ -52,11 +57,19 @@ public final class RuntimeRegionState {
         if (!initialized || this.sources.size() != sources.size()) {
             return false;
         }
-        return sources.entrySet().stream().allMatch(entry -> this.sources.get(entry.getKey()) == entry.getValue());
+        for (Map.Entry<Long, ?> entry : sources.entrySet()) {
+            WeakReference<Object> reference = this.sources.get(entry.getKey());
+            if (entry.getValue() == null || reference == null || !reference.refersTo(entry.getValue())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public synchronized void markSources(Map<Long, ?> sources) {
-        this.sources = Map.copyOf(sources);
+        Map<Long, WeakReference<Object>> identities = new HashMap<>(sources.size());
+        sources.forEach((key, value) -> identities.put(key, new WeakReference<>(value)));
+        this.sources = identities;
     }
 
     public synchronized long epoch() {
@@ -64,7 +77,7 @@ public final class RuntimeRegionState {
     }
 
     public synchronized boolean complete(long expectedEpoch, Object identity, Map<Long, ?> sources) {
-        if (epoch != expectedEpoch) {
+        if (unloaded || epoch != expectedEpoch) {
             return false;
         }
         markInitialized(identity);
@@ -77,6 +90,15 @@ public final class RuntimeRegionState {
         initialized = false;
         sources = Map.of();
         sourceIdentity = null;
+    }
+
+    public synchronized void unload() {
+        unloaded = true;
+        invalidate();
+    }
+
+    public boolean unloaded() {
+        return unloaded;
     }
 
     public void touch() {
