@@ -138,6 +138,16 @@ public final class LucisEngineController {
         return runtimeManagers.computeIfAbsent(level, ignored -> new LucisRuntimeManager(runtimeScheduler));
     }
 
+    public synchronized void onChunkUnloaded(Level level, int chunkX, int chunkZ) {
+        LucisRuntimeManager manager = runtimeManagers.get(level);
+        if (manager != null) manager.onChunkUnloaded(chunkX, chunkZ);
+    }
+
+    public synchronized void onLevelUnloaded(Level level) {
+        LucisRuntimeManager manager = runtimeManagers.remove(level);
+        if (manager != null) manager.close();
+    }
+
     public boolean enqueueLightCheck(LightChunkGetter getter, BlockPos pos) {
         if (!(getter.getLevel() instanceof Level level)) {
             return false;

@@ -74,6 +74,21 @@ public final class LucisRuntimeManager implements AutoCloseable {
         }
     }
 
+    public void onChunkUnloaded(int chunkX, int chunkZ) {
+        if (closed) return;
+        regionCache.onChunkUnloaded(chunkX, chunkZ);
+        // 先失效 epoch，再丢弃尚未交给发布器的提交；后台任务仍通过 epoch 拦截。
+        synchronized (commitQueue) {
+            commitQueue.removeIf(commit -> {
+                if (commit.state().epoch() != commit.epoch()) {
+                    commit.state().release();
+                    return true;
+                }
+                return false;
+            });
+        }
+    }
+
     public boolean enqueue(BlockChangeRecord record) {
         return record != null && enqueue(record.x(), record.y(), record.z(), record.oldState(), record.newState());
     }
@@ -326,7 +341,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
                         continue;
                     }
                     synchronized (commitQueue) {
-                        if (!closed) {
+                        if (!closed && ownedState.epoch() == prepared.epoch()) {
                             ownedState.retain();
                             commitQueue.add(new RuntimeCommit(result, expectedChunk, ownedState, prepared.epoch()));
                         }
@@ -365,7 +380,7 @@ public final class LucisRuntimeManager implements AutoCloseable {
     }
 
     private void requeue(long regionKey, RuntimeRegionBatch batch) {
-        if (batch == null || batch.isEmpty()) {
+        if (closed || batch == null || batch.isEmpty()) {
             return;
         }
         if (batch.fullRelight()) {

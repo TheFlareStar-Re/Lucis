@@ -20,6 +20,16 @@ public final class LucisServices {
         return current;
     }
 
+    public static void onChunkUnloaded(net.minecraft.world.level.Level level, int chunkX, int chunkZ) {
+        LucisEngineController current = controller;
+        if (current != null) current.onChunkUnloaded(level, chunkX, chunkZ);
+    }
+
+    public static void onLevelUnloaded(net.minecraft.world.level.Level level) {
+        LucisEngineController current = controller;
+        if (current != null) current.onLevelUnloaded(level);
+    }
+
     public static synchronized void resetController() {
         shutdownController();
         controller = new LucisEngineController();
